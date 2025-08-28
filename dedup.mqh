@@ -1,75 +1,348 @@
 //+------------------------------------------------------------------+
-//| Deduplication utilities                                           |
+//| Optimized Deduplication Module - Модуль дедупликации событий     |
+//| Предотвращает отправку дублирующихся событий на вебхук           |
+//| Использует хэширование и бинарный поиск для O(log n) скорости    |
 //+------------------------------------------------------------------+
 
-string g_DedupKeys[];
-ulong  g_DedupTimes[];
-int    g_DedupMaxSize = 256;
+//+------------------------------------------------------------------+
+//| Структура для хранения информации о событии в кэше               |
+//| key - уникальный ключ события (тип:тикет:время)                  |
+//| timestamp - время добавления в кэш (для очистки устаревших)      |
+//| hash - хэш ключа для быстрого сравнения                          |
+//+------------------------------------------------------------------+
+struct DedupEntry {
+   string key;          // Ключ события
+   ulong  timestamp;    // Время добавления
+   uint   hash;         // Хэш для быстрого сравнения
+};
 
-string BuildEventKey(string eventType, ulong ticket)
-{
-   return eventType + ":" + IntegerToString((long)ticket);
-}
-
-void PurgeOldDedupKeys()
-{
-   ulong now = GetTickCount64();
-   int n = ArraySize(g_DedupKeys);
-   if(n == 0)
-      return;
-   string newKeys[];
-   ulong  newTimes[];
-   ArrayResize(newKeys, 0);
-   ArrayResize(newTimes, 0);
-   for(int i=0;i<n;i++)
-   {
-      if(now - g_DedupTimes[i] <= (ulong)DedupWindowMs)
-      {
-         int idx = ArraySize(newKeys);
-         ArrayResize(newKeys, idx+1);
-         ArrayResize(newTimes, idx+1);
-         newKeys[idx] = g_DedupKeys[i];
-         newTimes[idx] = g_DedupTimes[i];
+//+------------------------------------------------------------------+
+//| Класс менеджера дедупликации                                     |
+//| Обеспечивает быструю проверку дубликатов через хэш-таблицу       |
+//| с бинарным поиском O(log n) вместо линейного O(n)                |
+//+------------------------------------------------------------------+
+class DedupManager {
+private:
+   DedupEntry m_entries[];     // Массив записей
+   int        m_maxSize;       // Максимальный размер кэша
+   int        m_windowMs;      // Окно дедупликации в мс
+   int        m_size;          // Текущий размер
+   bool       m_enabled;       // Включена ли дедупликация
+   
+   //+------------------------------------------------------------------+
+   //| Вычисление хэша строки по алгоритму DJB2                         |
+   //| str - строка для хэширования                                     |
+   //| Алгоритм DJB2: hash = hash * 33 + char                          |
+   //| Начальное значение 5381 выбрано эмпирически                      |
+   //| Возвращает: 32-битный хэш строки                                 |
+   //+------------------------------------------------------------------+
+   uint HashString(string str) {
+      uint hash = 5381;
+      int len = StringLen(str);
+      for(int i = 0; i < len; i++) {
+         ushort c = StringGetCharacter(str, i);
+         hash = ((hash << 5) + hash) + c; // hash * 33 + c
+      }
+      return hash;
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Бинарный поиск элемента по хэшу в отсортированном массиве        |
+   //| hash - хэш для поиска                                            |
+   //| Использует бинарный поиск для O(log n) производительности        |
+   //| Возвращает: индекс элемента или -1 если не найден                |
+   //+------------------------------------------------------------------+
+   int BinarySearch(uint hash) {
+      int left = 0;
+      int right = m_size - 1;
+      
+      while(left <= right) {
+         int mid = (left + right) / 2;
+         if(m_entries[mid].hash == hash) {
+            return mid;
+         }
+         else if(m_entries[mid].hash < hash) {
+            left = mid + 1;
+         }
+         else {
+            right = mid - 1;
+         }
+      }
+      return -1; // Не найдено
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Вставка нового элемента с сохранением сортировки массива         |
+   //| entry - структура события для вставки                            |
+   //| Массив всегда остается отсортированным по хэшу                   |
+   //| для возможности использования бинарного поиска                   |
+   //+------------------------------------------------------------------+
+   void InsertSorted(const DedupEntry &entry) {
+      if(m_size == 0) {
+         ArrayResize(m_entries, 1);
+         m_entries[0] = entry;
+         m_size = 1;
+         return;
+      }
+      
+      // Находим позицию для вставки
+      int pos = 0;
+      for(int i = 0; i < m_size; i++) {
+         if(m_entries[i].hash > entry.hash) {
+            pos = i;
+            break;
+         }
+         pos = i + 1;
+      }
+      
+      // Расширяем массив
+      ArrayResize(m_entries, m_size + 1);
+      
+      // Сдвигаем элементы
+      for(int i = m_size; i > pos; i--) {
+         m_entries[i] = m_entries[i-1];
+      }
+      
+      // Вставляем новый элемент
+      m_entries[pos] = entry;
+      m_size++;
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Очистка записей, превысивших окно дедупликации                   |
+   //| Удаляет из кэша события старше m_windowMs миллисекунд            |
+   //| Вызывается автоматически при проверке дубликатов                 |
+   //+------------------------------------------------------------------+
+   void PurgeExpired() {
+      ulong now = GetTickCount64();
+      int newSize = 0;
+      
+      // Создаем новый массив только с актуальными записями
+      DedupEntry newEntries[];
+      ArrayResize(newEntries, m_size);
+      
+      for(int i = 0; i < m_size; i++) {
+         if(now - m_entries[i].timestamp <= (ulong)m_windowMs) {
+            newEntries[newSize] = m_entries[i];
+            newSize++;
+         }
+      }
+      
+      // Обновляем массив
+      if(newSize < m_size) {
+         ArrayResize(newEntries, newSize);
+         ArrayCopy(m_entries, newEntries);
+         m_size = newSize;
       }
    }
-   g_DedupKeys = newKeys;
-   g_DedupTimes = newTimes;
+   
+public:
+   //+------------------------------------------------------------------+
+   //| Конструктор класса                                               |
+   //| Инициализирует параметры по умолчанию:                           |
+   //| - Размер кэша: 1024 записи                                       |
+   //| - Окно дедупликации: 600 мс                                      |
+   //| - Дедупликация включена по умолчанию                             |
+   //+------------------------------------------------------------------+
+   DedupManager() {
+      m_maxSize = 1024;  // Увеличен размер кэша
+      m_windowMs = 600;
+      m_size = 0;
+      m_enabled = true;
+      ArrayResize(m_entries, 0);
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Инициализация менеджера с пользовательскими параметрами          |
+   //| maxSize - максимальный размер кэша (количество записей)          |
+   //| windowMs - окно дедупликации в миллисекундах                     |
+   //| enabled - флаг включения/выключения дедупликации                 |
+   //+------------------------------------------------------------------+
+   void Init(int maxSize, int windowMs, bool enabled) {
+      m_maxSize = maxSize;
+      m_windowMs = windowMs;
+      m_enabled = enabled;
+      m_size = 0;
+      ArrayResize(m_entries, 0);
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Построение уникального ключа события                             |
+   //| eventType - тип события (OPEN, CLOSE и т.д.)                     |
+   //| ticket - тикет сделки/ордера/позиции                             |
+   //| time - опциональная временная метка для большей точности         |
+   //| Возвращает: уникальный ключ вида "тип:тикет[:время]"            |
+   //+------------------------------------------------------------------+
+   string BuildKey(string eventType, ulong ticket, datetime time = 0) {
+      string key = eventType + ":" + IntegerToString((long)ticket);
+      if(time > 0) {
+         key += ":" + IntegerToString((long)time);
+      }
+      return key;
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Проверка, является ли событие дубликатом                         |
+   //| eventType - тип события                                          |
+   //| ticket - тикет события                                           |
+   //| time - временная метка (опционально)                             |
+   //| Автоматически очищает устаревшие записи                          |
+   //| Возвращает: true если событие уже было, false если новое         |
+   //+------------------------------------------------------------------+
+   bool IsDuplicate(string eventType, ulong ticket, datetime time = 0) {
+      if(!m_enabled) return false;
+      
+      // Очищаем устаревшие записи
+      PurgeExpired();
+      
+      string key = BuildKey(eventType, ticket, time);
+      uint hash = HashString(key);
+      
+      // Быстрый поиск по хэшу
+      int index = BinarySearch(hash);
+      if(index >= 0) {
+         // Дополнительная проверка ключа (на случай коллизий хэшей)
+         if(m_entries[index].key == key) {
+            if(ShowDebugInfo) {
+               Print("Дедуп: подавлен повтор события ", key);
+            }
+            return true;
+         }
+      }
+      
+      return false;
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Добавление нового события в кэш дедупликации                     |
+   //| eventType - тип события                                          |
+   //| ticket - тикет события                                           |
+   //| time - временная метка (опционально)                             |
+   //| При переполнении кэша удаляет 25% самых старых записей           |
+   //+------------------------------------------------------------------+
+   void AddEvent(string eventType, ulong ticket, datetime time = 0) {
+      if(!m_enabled) return;
+      
+      string key = BuildKey(eventType, ticket, time);
+      uint hash = HashString(key);
+      
+      // Проверка размера кэша
+      if(m_size >= m_maxSize) {
+         // Сначала пробуем очистить устаревшие
+         PurgeExpired();
+         
+         // Если все еще переполнение, удаляем самые старые
+         if(m_size >= m_maxSize) {
+            int toRemove = m_size / 4; // Удаляем 25% самых старых
+            for(int i = toRemove; i < m_size; i++) {
+               m_entries[i - toRemove] = m_entries[i];
+            }
+            m_size -= toRemove;
+            ArrayResize(m_entries, m_size);
+         }
+      }
+      
+      // Создаем новую запись
+      DedupEntry entry;
+      entry.key = key;
+      entry.timestamp = GetTickCount64();
+      entry.hash = hash;
+      
+      // Вставляем с сохранением сортировки
+      InsertSorted(entry);
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Атомарная операция проверки и добавления                         |
+   //| eventType - тип события                                          |
+   //| ticket - тикет события                                           |
+   //| time - временная метка (опционально)                             |
+   //| Объединяет IsDuplicate и AddEvent для атомарности                |
+   //| Возвращает: true если событие новое, false если дубликат         |
+   //+------------------------------------------------------------------+
+   bool CheckAndAdd(string eventType, ulong ticket, datetime time = 0) {
+      if(IsDuplicate(eventType, ticket, time)) {
+         return false; // Дубликат
+      }
+      AddEvent(eventType, ticket, time);
+      return true; // Новое событие
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Получение статистики работы кэша дедупликации                    |
+   //| cacheSize - текущее количество записей в кэше (out)              |
+   //| maxSize - максимальный размер кэша (out)                         |
+   //| fillRate - процент заполненности кэша (out)                      |
+   //+------------------------------------------------------------------+
+   void GetStats(int &cacheSize, int &maxSize, double &fillRate) {
+      cacheSize = m_size;
+      maxSize = m_maxSize;
+      fillRate = m_size > 0 ? (double)m_size / m_maxSize * 100 : 0;
+   }
+   
+   //+------------------------------------------------------------------+
+   //| Полная очистка кэша дедупликации                                 |
+   //| Удаляет все записи и сбрасывает счетчики                         |
+   //| Используется при переинициализации или для тестирования          |
+   //+------------------------------------------------------------------+
+   void Clear() {
+      ArrayResize(m_entries, 0);
+      m_size = 0;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| Глобальный экземпляр менеджера дедупликации                      |
+//| Используется всеми функциями для проверки дубликатов             |
+//+------------------------------------------------------------------+
+DedupManager g_DedupManager;
+
+//+------------------------------------------------------------------+
+//| Функции обратной совместимости с предыдущей версией              |
+//| Обеспечивают работу старого кода без изменений                   |
+//+------------------------------------------------------------------+
+string BuildEventKey(string eventType, ulong ticket) {
+   return g_DedupManager.BuildKey(eventType, ticket);
 }
 
-bool ShouldSendEvent(string eventType, ulong ticket)
-{
-   if(!EnableDedup)
-      return true;
-   if(eventType != "CLOSE")
-      return true;
-   PurgeOldDedupKeys();
-   string key = BuildEventKey(eventType, ticket);
-   int n = ArraySize(g_DedupKeys);
-   for(int i=0;i<n;i++)
-   {
-      if(g_DedupKeys[i] == key)
-      {
-         if(ShowDebugInfo)
-            Print("Дедуп: подавлен повтор события ", key);
-         return false;
-      }
-   }
-   if(n >= g_DedupMaxSize)
-   {
-      for(int j=1;j<n;j++)
-      {
-         g_DedupKeys[j-1] = g_DedupKeys[j];
-         g_DedupTimes[j-1] = g_DedupTimes[j];
-      }
-      n--;
-      ArrayResize(g_DedupKeys, n);
-      ArrayResize(g_DedupTimes, n);
-   }
-   ArrayResize(g_DedupKeys, n+1);
-   ArrayResize(g_DedupTimes, n+1);
-   g_DedupKeys[n] = key;
-   g_DedupTimes[n] = GetTickCount64();
-   return true;
+void PurgeOldDedupKeys() {
+   // Теперь очистка происходит автоматически в DedupManager
 }
 
+bool ShouldSendEvent(string eventType, ulong ticket) {
+   if(!EnableDedup) return true;
+   
+   // Расширяем дедупликацию на все критичные события
+   bool needsDedup = (eventType == "CLOSE" || 
+                      eventType == "PARTIAL_CLOSE" ||
+                      eventType == "OPEN");
+   
+   if(!needsDedup) return true;
+   
+   // Используем оптимизированную проверку
+   return g_DedupManager.CheckAndAdd(eventType, ticket, TimeCurrent());
+}
 
+//+------------------------------------------------------------------+
+//| Инициализация менеджера дедупликации при запуске советника       |
+//| maxSize - максимальный размер кэша (по умолчанию 1024)           |
+//| windowMs - окно дедупликации в мс (по умолчанию 600)             |
+//| Вызывается из OnInit() главного модуля                           |
+//+------------------------------------------------------------------+
+void InitDedup(int maxSize = 1024, int windowMs = 600) {
+   g_DedupManager.Init(maxSize, windowMs, EnableDedup);
+}
+
+//+------------------------------------------------------------------+
+//| Получение форматированной строки со статистикой дедупликации     |
+//| Используется для отображения в логах и отладке                   |
+//| Возвращает: строку вида "Dedup Cache: 150/1024 (14.6% full)"     |
+//+------------------------------------------------------------------+
+string GetDedupStats() {
+   int cacheSize, maxSize;
+   double fillRate;
+   g_DedupManager.GetStats(cacheSize, maxSize, fillRate);
+   
+   return StringFormat("Dedup Cache: %d/%d (%.1f%% full)", 
+                      cacheSize, maxSize, fillRate);
+}

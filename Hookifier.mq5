@@ -5,12 +5,12 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Lavara Software Ltd."
 #property link      "https://www.mql5.com"
-#property version   "1.21"
+#property version   "1.22"
 #property description "Hookifier: Эксперт для отправки уведомлений о сделках на вебхук"
 
 // Версии схемы и эксперта (держите в синхронизации с #property version)
 #define JSON_SCHEMA_VERSION "1.0"
-#define EA_VERSION          "1.21"
+#define EA_VERSION          "1.22"
 
 #include "logger.mqh"
 #include "utils.mqh"
@@ -41,7 +41,6 @@ input int      DedupWindowMs = 600;     // Окно дедупликации (м
 
 
 
-// Кэш и дедуп теперь в utils.mqh и dedup.mqh
 
 
 //+------------------------------------------------------------------+
@@ -53,6 +52,10 @@ int OnInit()
    
    // Инициализируем кэш
    InitializeCache();
+   
+   // Инициализируем оптимизированную дедупликацию
+   InitDedup(1024, DedupWindowMs);
+   
    // Применим входные настройки (используются напрямую из input)
    
    LogInfo("Отправка на вебхук: " + (SendToWebhook ? "Включена" : "Отключена"));
@@ -75,10 +78,6 @@ int OnInit()
          TestWebhookConnection();
    }
    
-   // Инициализация больше не нужна с OnTradeTransaction
-   
-   // Таймер больше не нужен, так как используем OnTradeTransaction
-   // EventSetMillisecondTimer(g_UpdateInterval);
    
    return(INIT_SUCCEEDED);
 }
@@ -89,7 +88,6 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   // EventKillTimer(); // Таймер больше не используется
    
    LogInfo("=== Webhook Expert Advisor остановлен ===");
 }
@@ -150,31 +148,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 //| Timer function                                                   |
 //+------------------------------------------------------------------+
-void OnTimer()
-{
-   // Таймер теперь используется только для периодических проверок
-   // Основная логика перенесена в OnTradeTransaction
-}
 
-//+------------------------------------------------------------------+
-//| Инициализация кэша                                               |
-//+------------------------------------------------------------------+
-void InitializeCache();
-
-//+------------------------------------------------------------------+
-//| Получение кэшированной информации об аккаунте                    |
-//+------------------------------------------------------------------+
-string GetCachedAccountInfo();
-
-//+------------------------------------------------------------------+
-//| Получение кэшированной информации о брокере                      |
-//+------------------------------------------------------------------+
-string GetCachedBrokerInfo();
-
-//+------------------------------------------------------------------+
-//| Получение сектора символа                                        |
-//+------------------------------------------------------------------+
-int GetSymbolSector(string symbol);
 
 
 
@@ -292,7 +266,6 @@ void ProcessOrderDeleteTransaction(const MqlTradeTransaction& trans)
          // Получим position_id из истории ордера
          ulong posId = HistoryOrderGetInteger(trans.order, ORDER_POSITION_ID);
          SendOrderNotification("ACTIVATED", trans.order, posId);
-         // Ордер исполнен — кеш не используется
       }
       else if(orderState == ORDER_STATE_CANCELED)
       {
@@ -306,7 +279,6 @@ void ProcessOrderDeleteTransaction(const MqlTradeTransaction& trans)
          if(ShowDebugInfo)
             Print("  Ордер частично исполнен: ", trans.order);
          SendOrderNotification("PARTIAL", trans.order);
-         // PARTIAL в истории: отложка частично исполнена
       }
       else if(orderState == ORDER_STATE_REJECTED)
       {
@@ -366,28 +338,6 @@ void ProcessRequestTransaction(const MqlTradeTransaction& trans, const MqlTradeR
 
 
 
-//+------------------------------------------------------------------+
-//| Поиск сделки закрытия для позиции                                |
-//+------------------------------------------------------------------+
-ulong FindCloseDealForPosition(ulong positionTicket)
-{
-   for(int i = 0; i < HistoryDealsTotal(); i++)
-   {
-      ulong dealTicket = HistoryDealGetTicket(i);
-      
-      if(HistoryDealSelect(dealTicket))
-      {
-         ulong dealPositionID = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-         ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-         
-         if(dealPositionID == positionTicket && dealEntry == DEAL_ENTRY_OUT)
-         {
-            return dealTicket;
-         }
-      }
-   }
-   return 0;
-}
 
 //+------------------------------------------------------------------+
 //| Валидация торговых данных                                        |
@@ -527,60 +477,6 @@ void SendOrderSltpUpdateNotification(ulong orderTicket)
    SendWebhookJSONWithRetry(json);
 }
 
-//+------------------------------------------------------------------+
-//| Создание базового JSON для всех событий                           |
-//+------------------------------------------------------------------+
-string CreateBaseJSON(string eventType, ulong ticket);
-
-//+------------------------------------------------------------------+
-//| Дедупликация: хэш события                                         |
-//+------------------------------------------------------------------+
-string BuildEventKey(string eventType, ulong ticket);
-
-//+------------------------------------------------------------------+
-//| Дедупликация: очистка устаревших ключей                           |
-//+------------------------------------------------------------------+
-void PurgeOldDedupKeys();
-
-//+------------------------------------------------------------------+
-//| Дедупликация: проверка и запись события                           |
-//+------------------------------------------------------------------+
-bool ShouldSendEvent(string eventType, ulong ticket);
-
-//+------------------------------------------------------------------+
-//| Создание JSON для позиции                                         |
-//+------------------------------------------------------------------+
-string CreatePositionJSON(ulong ticket);
-
-//+------------------------------------------------------------------+
-//| Создание JSON для сделки                                          |
-//+------------------------------------------------------------------+
-string CreateDealJSON(ulong ticket, string eventType);
-
-//+------------------------------------------------------------------+
-//| Создание JSON для ордера                                          |
-//+------------------------------------------------------------------+
-string CreateOrderJSON(ulong ticket, bool isHistorical = false);
-
-//+------------------------------------------------------------------+
-//| JSON для обновления SL/TP ордера                                 |
-//+------------------------------------------------------------------+
-string CreateOrderSltpUpdateJSON(ulong ticket);
-
-//+------------------------------------------------------------------+
-//| JSON для обновления SL/TP позиции                                 |
-//+------------------------------------------------------------------+
-string CreatePositionSltpUpdateJSON(ulong positionTicket);
-
-//+------------------------------------------------------------------+
-//| Создание JSON для информации о позиции                            |
-//+------------------------------------------------------------------+
-string CreatePositionInfoJSON(ulong positionTicket);
-
-//+------------------------------------------------------------------+
-//| Создание стандартизированного JSON для всех типов событий         |
-//+------------------------------------------------------------------+
-string CreateStandardJSON(string eventType, ulong ticket, ulong positionTicket = 0);
 
 
 
@@ -601,70 +497,11 @@ string GetOrderTypeString(ENUM_ORDER_TYPE orderType)
    }
 }
 
-//+------------------------------------------------------------------+
-//| Отправка JSON на вебхук с повторными попытками                   |
-//+------------------------------------------------------------------+
-bool SendWebhookJSONWithRetry(string jsonData);
-
-//+------------------------------------------------------------------+
-//| Универсальная функция отправки JSON на вебхук                    |
-//+------------------------------------------------------------------+
-bool SendWebhookJSON(string jsonData);
 
 
 
-//+------------------------------------------------------------------+
-//| Принудительная проверка всех закрытых сделок                     |
-//+------------------------------------------------------------------+
-void ForceCheckClosedTrades()
-{
-   if(ShowDebugInfo)
-      LogInfo("Принудительная проверка закрытых сделок");
-   
-   // Реализация проверки закрытых сделок
-   // Можно добавить логику для проверки всех закрытых сделок
-}
 
 
-//+------------------------------------------------------------------+
-//| Структурированное логирование                                    |
-//+------------------------------------------------------------------+
-void LogInfo(string message, string details = "")
-{
-   string logMessage = TimeToString(TimeCurrent()) + " INFO: " + message;
-   if(details != "")
-      logMessage += " | " + details;
-   
-   Print(logMessage);
-}
-
-void LogError(string message, string details = "")
-{
-   string logMessage = TimeToString(TimeCurrent()) + " ERROR: " + message;
-   if(details != "")
-      logMessage += " | " + details;
-   
-   Print(logMessage);
-}
-
-void LogWarning(string message, string details = "")
-{
-   string logMessage = TimeToString(TimeCurrent()) + " WARNING: " + message;
-   if(details != "")
-      logMessage += " | " + details;
-   
-   Print(logMessage);
-}
-
-void LogDebug(string message, string details = "")
-{
-   if(!ShowDebugInfo)
-      return;
-   string logMessage = TimeToString(TimeCurrent()) + " DEBUG: " + message;
-   if(details != "")
-      logMessage += " | " + details;
-   Print(logMessage);
-}
 
 //+------------------------------------------------------------------+
 //| Показать текущие настройки                                       |
@@ -680,105 +517,6 @@ void ShowCurrentSettings()
    LogInfo("RetryDelay: " + IntegerToString(RetryDelay) + " мс");
    LogInfo("EnableDedup: " + (EnableDedup ? "Включено" : "Отключено"));
    LogInfo("DedupWindowMs: " + IntegerToString(DedupWindowMs) + " мс");
+   LogInfo("Dedup Stats: " + GetDedupStats());
    LogInfo("=========================");
 }
-
-//+------------------------------------------------------------------+
-//| Проверка валидности JSON                                         |
-//+------------------------------------------------------------------+
-bool IsValidJSON(string jsonData)
-{
-   // Проверяем базовую структуру JSON
-   if(StringLen(jsonData) == 0)
-      return false;
-      
-   // Проверяем, что JSON начинается с { и заканчивается на }
-   if(StringGetCharacter(jsonData, 0) != '{')
-      return false;
-      
-   if(StringGetCharacter(jsonData, StringLen(jsonData) - 1) != '}')
-      return false;
-      
-   // Проверяем на наличие лишних символов в конце
-   string trimmed = jsonData;
-   StringTrimRight(trimmed);
-   if(StringLen(trimmed) != StringLen(jsonData))
-   {
-      LogWarning("⚠ Обнаружены лишние символы в конце JSON");
-      return false;
-   }
-   
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| Экранирование специальных символов для JSON                      |
-//+------------------------------------------------------------------+
-string EscapeJSONString(string text)
-{
-   string result = "";
-   int len = StringLen(text);
-   
-   for(int i = 0; i < len; i++)
-   {
-      ushort ch = StringGetCharacter(text, i);
-      
-      switch(ch)
-      {
-         case '"':  result += "\\\""; break;
-         case '\\': result += "\\\\"; break;
-         case 8:    result += "\\b";  break;  // \b
-         case 12:   result += "\\f";  break;  // \f
-         case 10:   result += "\\n";  break;  // \n
-         case 13:   result += "\\r";  break;  // \r
-         case 9:    result += "\\t";  break;  // \t
-         default:
-                         if(ch < 32 || ch > 126)
-             {
-                // Экранируем Unicode символы
-                result += "\\u" + StringFormat("%04X", ch);
-             }
-             else
-             {
-                result += ShortToString(ch);
-             }
-            break;
-      }
-   }
-   
-   return result;
-}
-
-//+------------------------------------------------------------------+
-//| Форматирование времени в ISO-8601 (UTC, с Z)                      |
-//+------------------------------------------------------------------+
-string ToIso8601(datetime t)
-{
-   MqlDateTime dt;
-   TimeToStruct(t, dt);
-   // Используем локальное время терминала; при желании можно TimeGMT()
-   return StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ",
-                       dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
-}
-
-//+------------------------------------------------------------------+
-//| Получение точности цены для символа                               |
-//+------------------------------------------------------------------+
-int GetDigitsForSymbol(string symbol)
-{
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   if(digits <= 0) digits = 5; // запасной вариант
-   return digits;
-}
-
-
-
-//+------------------------------------------------------------------+
-//| Проверка URL вебхука                                             |
-//+------------------------------------------------------------------+
-void CheckWebhookURL();
-
-//+------------------------------------------------------------------+
-//| Тестирование соединения с вебхуком                               |
-//+------------------------------------------------------------------+
-void TestWebhookConnection();

@@ -1,22 +1,41 @@
 //+------------------------------------------------------------------+
-//| Simple JSON builder and payload creators                          |
+//| JSON Builder - Модуль построения JSON для вебхука                   |
+//| Содержит класс JsonBuilder и функции создания JSON                |
+//| для всех типов торговых событий                                   |
 //+------------------------------------------------------------------+
 
+//+------------------------------------------------------------------+
+//| Класс для удобного построения JSON строк                          |
+//| Обеспечивает правильное форматирование, экранирование          |
+//| и расстановку запятых между полями JSON                          |
+//+------------------------------------------------------------------+
 class JsonBuilder
 {
 private:
    string buffer;
    bool   first;
 public:
+   //+------------------------------------------------------------------+
+   //| Начало построения JSON объекта                                  |
+   //| Инициализирует буфер открывающей фигурной скобкой            |
+   //+------------------------------------------------------------------+
    void Begin()
    {
       buffer = "{";
       first = true;
    }
+   //+------------------------------------------------------------------+
+   //| Завершение построения JSON объекта                               |
+   //| Добавляет закрывающую фигурную скобку                          |
+   //+------------------------------------------------------------------+
    void End()
    {
       buffer += "}";
    }
+   //+------------------------------------------------------------------+
+   //| Получение готовой JSON строки                                   |
+   //| Возвращает: сформированную JSON строку                          |
+   //+------------------------------------------------------------------+
    string Str()
    {
       return buffer;
@@ -26,11 +45,22 @@ public:
       if(!first) buffer += ",";
       first = false;
    }
+   //+------------------------------------------------------------------+
+   //| Добавление строкового свойства в JSON                             |
+   //| key - название поля                                            |
+   //| value - значение (автоматически экранируется)                 |
+   //+------------------------------------------------------------------+
    void PropString(string key, string value)
    {
       CommaIfNeeded();
       buffer += "\"" + key + "\":\"" + EscapeJSONString(value) + "\"";
    }
+   //+------------------------------------------------------------------+
+   //| Добавление числового свойства с десятичными знаками             |
+   //| key - название поля                                            |
+   //| value - числовое значение                                       |
+   //| digits - количество знаков после запятой                        |
+   //+------------------------------------------------------------------+
    void PropNumber(string key, double value, int digits = 0)
    {
       CommaIfNeeded();
@@ -39,11 +69,21 @@ public:
       else
          buffer += "\"" + key + "\":" + DoubleToString(value, 0);
    }
+   //+------------------------------------------------------------------+
+   //| Добавление целочисленного свойства                                |
+   //| key - название поля                                            |
+   //| value - целочисленное значение                                   |
+   //+------------------------------------------------------------------+
    void PropInteger(string key, long value)
    {
       CommaIfNeeded();
       buffer += "\"" + key + "\":" + IntegerToString(value);
    }
+   //+------------------------------------------------------------------+
+   //| Добавление булевого свойства                                     |
+   //| key - название поля                                            |
+   //| value - булево значение (true/false)                            |
+   //+------------------------------------------------------------------+
    void PropBool(string key, bool value)
    {
       CommaIfNeeded();
@@ -51,6 +91,15 @@ public:
    }
 };
 
+//+------------------------------------------------------------------+
+//| Создание базового JSON для всех типов событий                      |
+//| eventType - тип события (OPEN, CLOSE, PENDING и т.д.)             |
+//| ticket - тикет сделки/ордера/позиции                             |
+//| Содержит обязательные поля: event, ticket, timestamp,            |
+//| account, broker, schema_version, ea_version                        |
+//| Автоматически добавляет symbol, sector, position_id при наличии  |
+//| Возвращает: JSON строку с базовыми полями                         |
+//+------------------------------------------------------------------+
 string CreateBaseJSON(string eventType, ulong ticket)
 {
    JsonBuilder jb;
@@ -59,7 +108,7 @@ string CreateBaseJSON(string eventType, ulong ticket)
    jb.PropInteger("ticket", (long)ticket);
    jb.PropString("timestamp", ToIso8601(TimeCurrent()));
    jb.PropInteger("account", (long)AccountInfoInteger(ACCOUNT_LOGIN));
-   jb.PropString("broker", AccountInfoString(ACCOUNT_COMPANY));
+   jb.PropString("broker", EscapeJSONString(AccountInfoString(ACCOUNT_COMPANY)));
    jb.PropString("schema_version", JSON_SCHEMA_VERSION);
    jb.PropString("ea_version", EA_VERSION);
 
@@ -146,6 +195,12 @@ string CreateBaseJSON(string eventType, ulong ticket)
    return jb.Str();
 }
 
+//+------------------------------------------------------------------+
+//| Создание JSON для открытой позиции                                |
+//| ticket - тикет позиции                                            |
+//| Содержит поля: type, volume, price, profit, swap, sl, tp, comment|
+//| Возвращает: JSON строку без обрамляющих фигурных скобок         |
+//+------------------------------------------------------------------+
 string CreatePositionJSON(ulong ticket)
 {
    string json = "";
@@ -161,8 +216,8 @@ string CreatePositionJSON(ulong ticket)
       jb.PropNumber("price", PositionGetDouble(POSITION_PRICE_OPEN), digits);
       jb.PropNumber("profit", PositionGetDouble(POSITION_PROFIT), 2);
       jb.PropNumber("swap", PositionGetDouble(POSITION_SWAP), 2);
-      jb.PropNumber("stop_loss", PositionGetDouble(POSITION_SL), digits);
-      jb.PropNumber("take_profit", PositionGetDouble(POSITION_TP), digits);
+      jb.PropNumber("sl", PositionGetDouble(POSITION_SL), digits);
+      jb.PropNumber("tp", PositionGetDouble(POSITION_TP), digits);
       jb.PropString("comment", PositionGetString(POSITION_COMMENT));
       jb.End();
       json = jb.Str();
@@ -171,6 +226,14 @@ string CreatePositionJSON(ulong ticket)
    return json;
 }
 
+//+------------------------------------------------------------------+
+//| Создание JSON для сделки закрытия/частичного закрытия          |
+//| ticket - тикет сделки                                             |
+//| eventType - тип события (CLOSE, PARTIAL_CLOSE)                  |
+//| Содержит: type, volume, price, profit, swap, commission,         |
+//| total_profit (для закрытия), comment, partial_close              |
+//| Возвращает: JSON строку без обрамляющих фигурных скобок         |
+//+------------------------------------------------------------------+
 string CreateDealJSON(ulong ticket, string eventType)
 {
    string json = "";
@@ -204,6 +267,13 @@ string CreateDealJSON(ulong ticket, string eventType)
    return json;
 }
 
+//+------------------------------------------------------------------+
+//| Создание JSON для ордера (активного или исторического)          |
+//| ticket - тикет ордера                                             |
+//| isHistorical - true для исторических ордеров                   |
+//| Содержит: type, volume, price, sl, tp, comment                    |
+//| Возвращает: JSON строку без обрамляющих фигурных скобок         |
+//+------------------------------------------------------------------+
 string CreateOrderJSON(ulong ticket, bool isHistorical = false)
 {
    string json = "";
@@ -240,8 +310,8 @@ string CreateOrderJSON(ulong ticket, bool isHistorical = false)
       jb.PropString("type", GetOrderTypeString(type));
       jb.PropNumber("volume", volume, 2);
       jb.PropNumber("price", price, digits);
-      jb.PropNumber("stop_loss", sl, digits);
-      jb.PropNumber("take_profit", tp, digits);
+      jb.PropNumber("sl", sl, digits);
+      jb.PropNumber("tp", tp, digits);
       jb.PropString("comment", comment);
       jb.End();
       json = jb.Str();
@@ -250,6 +320,13 @@ string CreateOrderJSON(ulong ticket, bool isHistorical = false)
    return json;
 }
 
+//+------------------------------------------------------------------+
+//| Создание JSON для обновления SL/TP ордера                         |
+//| ticket - тикет ордера                                             |
+//| Проверяет сначала активные, затем исторические ордера         |
+//| Содержит: sl, tp, symbol                                          |
+//| Возвращает: JSON строку без обрамляющих фигурных скобок         |
+//+------------------------------------------------------------------+
 string CreateOrderSltpUpdateJSON(ulong ticket)
 {
    string json = "";
@@ -281,6 +358,12 @@ string CreateOrderSltpUpdateJSON(ulong ticket)
    return json;
 }
 
+//+------------------------------------------------------------------+
+//| Создание JSON для обновления SL/TP позиции                       |
+//| positionTicket - тикет позиции                                     |
+//| Содержит: sl, tp, symbol                                          |
+//| Возвращает: JSON строку без обрамляющих фигурных скобок         |
+//+------------------------------------------------------------------+
 string CreatePositionSltpUpdateJSON(ulong positionTicket)
 {
    string json = "";
@@ -302,6 +385,13 @@ string CreatePositionSltpUpdateJSON(ulong positionTicket)
    return json;
 }
 
+//+------------------------------------------------------------------+
+//| Создание JSON с информацией о позиции                           |
+//| positionTicket - тикет позиции                                     |
+//| Содержит: position_ticket, position_price, position_profit        |
+//| Используется для дополнительной информации об активированных ордерах|
+//| Возвращает: JSON строку без обрамляющих фигурных скобок         |
+//+------------------------------------------------------------------+
 string CreatePositionInfoJSON(ulong positionTicket)
 {
    string json = "";
@@ -321,31 +411,56 @@ string CreatePositionInfoJSON(ulong positionTicket)
    return json;
 }
 
+//+------------------------------------------------------------------+
+//| Создание полного JSON для любого типа события                      |
+//| eventType - тип события                                          |
+//| ticket - тикет события                                           |
+//| positionTicket - опциональный тикет позиции                       |
+//| Объединяет базовый JSON с дополнительными полями в зависимости  |
+//| от типа события. Правильно удаляет закрывающую скобку из        |
+//| базового JSON перед добавлением дополнительных полей          |
+//| Возвращает: полный JSON объект готовый для отправки            |
+//+------------------------------------------------------------------+
 string CreateStandardJSON(string eventType, ulong ticket, ulong positionTicket = 0)
 {
    string json = CreateBaseJSON(eventType, ticket);
+   
+   // Удаляем закрывающую скобку из базового JSON
+   json = StringSubstr(json, 0, StringLen(json) - 1);
+   
+   string additionalJson = "";
+   
    if(eventType == "OPEN")
-      json += CreatePositionJSON(ticket);
+      additionalJson = CreatePositionJSON(ticket);
    else if(eventType == "CLOSE" || eventType == "PARTIAL_CLOSE")
-      json += CreateDealJSON(ticket, eventType);
+      additionalJson = CreateDealJSON(ticket, eventType);
    else if(eventType == "PENDING")
-      json += CreateOrderJSON(ticket, false);
+      additionalJson = CreateOrderJSON(ticket, false);
    else if(eventType == "ACTIVATED")
    {
-      json += CreateOrderJSON(ticket, true);
+      additionalJson = CreateOrderJSON(ticket, true);
       if(positionTicket != 0)
-         json += CreatePositionInfoJSON(positionTicket);
+      {
+         string posInfo = CreatePositionInfoJSON(positionTicket);
+         if(posInfo != "")
+            additionalJson += "," + posInfo;
+      }
    }
    else if(eventType == "ORDER_SLTP_UPDATE")
-      json += CreateOrderSltpUpdateJSON(ticket);
+      additionalJson = CreateOrderSltpUpdateJSON(ticket);
    else if(eventType == "POSITION_SLTP_UPDATE")
-      json += CreatePositionSltpUpdateJSON(ticket);
+      additionalJson = CreatePositionSltpUpdateJSON(ticket);
    else if(eventType == "DELETE" || eventType == "CANCELED" || eventType == "PARTIAL" || eventType == "REJECTED" || eventType == "EXPIRED")
    {
-      json += CreateOrderJSON(ticket, true);
+      additionalJson = CreateOrderJSON(ticket, true);
       if(eventType != "DELETE")
-         json += ",\"state\":\"" + eventType + "\"";
+         additionalJson += ",\"state\":\"" + eventType + "\"";
    }
+   
+   // Добавляем дополнительные поля если есть
+   if(additionalJson != "")
+      json += "," + additionalJson;
+   
    json += "}";
    return json;
 }
