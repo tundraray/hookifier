@@ -1,12 +1,16 @@
 //+------------------------------------------------------------------+
-//|                                                      Webhook.mq5 |
+//|                                                    Hookifier.mq5 |
 //|                             Copyright 2025, Lavara Software Ltd. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Lavara Software Ltd."
 #property link      "https://www.mql5.com"
 #property version   "1.21"
-#property description "Эксперт для отправки уведомлений о сделках на вебхук"
+#property description "Hookifier: Эксперт для отправки уведомлений о сделках на вебхук"
+
+// Версии схемы и эксперта (держите в синхронизации с #property version)
+#define JSON_SCHEMA_VERSION "1.0"
+#define EA_VERSION          "1.21"
 
 //--- Входные параметры
 input group   "=== Настройки вебхука ==="
@@ -16,6 +20,12 @@ input int      WebhookTimeout = 5000;    // Таймаут вебхука в м�
 
 input group   "=== Дополнительные настройки ==="
 input bool     ShowDebugInfo = true;    // Показывать отладочную информацию
+input bool     TestWebhookOnInit = true; // Тестировать вебхук при запуске
+
+input group   "=== Фильтры событий ==="
+input bool     EnableOrderEvents = true;     // Отправлять события по ордерам
+input bool     EnablePositionEvents = true;  // Отправлять события по позициям/сделкам
+input bool     EnableSltpEvents = true;      // Отправлять события обновления SL/TP
 
 input group   "=== Настройки надежности ==="
 input int      MaxRetries = 3;          // Максимальное количество попыток
@@ -23,14 +33,6 @@ input int      RetryDelay = 1000;       // Задержка между попы�
 input bool     EnableDedup = true;      // Включить подавление дубликатов событий
 input int      DedupWindowMs = 600;     // Окно дедупликации (мс)
 
-//--- Глобальные переменные
-// Переменные для хранения настроек (изменяемые)
-bool g_SendToWebhook = false;
-string g_WebhookURL = "";
-int g_WebhookTimeout = 5000;
-bool g_ShowDebugInfo = false;
-bool g_EnableDedup = true;
-int  g_DedupWindowMs = 600;
 
 
 // Кэш для часто используемых данных
@@ -50,35 +52,28 @@ int OnInit()
 {
    LogInfo("=== Webhook Expert Advisor инициализирован ===");
    
-   // Настройки всегда берём из input
-   g_WebhookURL = WebhookURL;
-   g_WebhookTimeout = WebhookTimeout;
-   g_SendToWebhook = SendToWebhook;
-   g_ShowDebugInfo = ShowDebugInfo;
-   
    // Инициализируем кэш
    InitializeCache();
-   // Применим входные настройки для дедупликации
-   g_EnableDedup = EnableDedup;
-   g_DedupWindowMs = DedupWindowMs;
+   // Применим входные настройки (используются напрямую из input)
    
-   LogInfo("Отправка на вебхук: " + (g_SendToWebhook ? "Включена" : "Отключена"));
+   LogInfo("Отправка на вебхук: " + (SendToWebhook ? "Включена" : "Отключена"));
 
-   LogInfo("Таймаут вебхука: " + IntegerToString(g_WebhookTimeout) + " мс");
+   LogInfo("Таймаут вебхука: " + IntegerToString(WebhookTimeout) + " мс");
    
-   if(g_SendToWebhook)
+   if(SendToWebhook)
    {
-      if(g_WebhookURL == "")
+      if(WebhookURL == "")
       {
          LogError("URL вебхука не указан!");
          return(INIT_PARAMETERS_INCORRECT);
       }
       
-      LogInfo("URL вебхука: " + g_WebhookURL);
+      LogInfo("URL вебхука: " + WebhookURL);
       CheckWebhookURL();
       
-      // Тестируем вебхук при запуске
-      TestWebhookConnection();
+      // Тестируем вебхук при запуске (по настройке)
+      if(TestWebhookOnInit)
+         TestWebhookConnection();
    }
    
    // Инициализация больше не нужна с OnTradeTransaction
@@ -107,34 +102,39 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                        const MqlTradeRequest& request,
                        const MqlTradeResult& result)
 {
-   if(!g_SendToWebhook || g_WebhookURL == "")
+   if(!SendToWebhook || WebhookURL == "")
       return;
    
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("=== Торговая транзакция: ", trans.type, " ===");
    
    // Обрабатываем различные типы транзакций
    switch(trans.type)
    {
       case TRADE_TRANSACTION_DEAL_ADD:
-         ProcessDealTransaction(trans);
+         if(EnablePositionEvents)
+            ProcessDealTransaction(trans);
          break;
          
       case TRADE_TRANSACTION_ORDER_ADD:
-         ProcessOrderTransaction(trans);
+         if(EnableOrderEvents)
+            ProcessOrderTransaction(trans);
          break;
 
       case TRADE_TRANSACTION_ORDER_UPDATE:
-         ProcessOrderUpdateTransaction(trans, request);
+         if(EnableOrderEvents && EnableSltpEvents)
+            ProcessOrderUpdateTransaction(trans, request);
          break;
 
          
       case TRADE_TRANSACTION_ORDER_DELETE:
-         ProcessOrderDeleteTransaction(trans);
+         if(EnableOrderEvents)
+            ProcessOrderDeleteTransaction(trans);
          break;
          
       case TRADE_TRANSACTION_POSITION:
-         ProcessPositionTransaction(trans, request);
+         if(EnablePositionEvents && EnableSltpEvents)
+            ProcessPositionTransaction(trans, request);
          break;
          
       case TRADE_TRANSACTION_REQUEST:
@@ -142,7 +142,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          break;
          
       default:
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("Необработанный тип транзакции: ", trans.type);
          break;
    }
@@ -203,7 +203,7 @@ int GetSymbolSector(string symbol)
 //+------------------------------------------------------------------+
 void ProcessDealTransaction(const MqlTradeTransaction& trans)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Обработка транзакции сделки: ", trans.deal);
    
    if(HistoryDealSelect(trans.deal))
@@ -211,13 +211,13 @@ void ProcessDealTransaction(const MqlTradeTransaction& trans)
       ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
       ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
       
-      if(g_ShowDebugInfo)
+      if(ShowDebugInfo)
          Print("  Тип сделки: ", dealType, ", Вход: ", dealEntry);
       
              // Открытие позиции (вход в позицию)
        if(dealEntry == DEAL_ENTRY_IN)
        {
-          if(g_ShowDebugInfo)
+          if(ShowDebugInfo)
              Print("  Открытие позиции: ", trans.deal);
           
           // Получаем тикет позиции из сделки
@@ -234,14 +234,14 @@ void ProcessDealTransaction(const MqlTradeTransaction& trans)
       // Закрытие позиции (выход из позиции)
       else if(dealEntry == DEAL_ENTRY_OUT)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Закрытие позиции: ", trans.deal);
          SendTradeNotification("CLOSE", trans.deal);
       }
       // Частичное закрытие
       else if(dealEntry == DEAL_ENTRY_OUT_BY)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Частичное закрытие позиции: ", trans.deal);
          SendTradeNotification("PARTIAL_CLOSE", trans.deal);
       }
@@ -253,14 +253,14 @@ void ProcessDealTransaction(const MqlTradeTransaction& trans)
 //+------------------------------------------------------------------+
 void ProcessOrderTransaction(const MqlTradeTransaction& trans)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Обработка транзакции ордера: ", trans.order);
    
    if(OrderSelect(trans.order))
    {
       ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
       
-      if(g_ShowDebugInfo)
+      if(ShowDebugInfo)
          Print("  Создание отложенного ордера: ", trans.order, " типа: ", GetOrderTypeString(orderType));
       
       SendOrderNotification("PENDING", trans.order);
@@ -272,7 +272,7 @@ void ProcessOrderTransaction(const MqlTradeTransaction& trans)
 //+------------------------------------------------------------------+
 void ProcessOrderUpdateTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& request)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Обновление ордера: ", trans.order);
 
    // Если это изменение SL/TP (или общая модификация с изменением SL/TP) — отправляем событие
@@ -294,7 +294,7 @@ void ProcessOrderUpdateTransaction(const MqlTradeTransaction& trans, const MqlTr
 //+------------------------------------------------------------------+
 void ProcessOrderDeleteTransaction(const MqlTradeTransaction& trans)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Обработка удаления ордера: ", trans.order);
    
    // Проверяем состояние ордера в истории
@@ -302,12 +302,12 @@ void ProcessOrderDeleteTransaction(const MqlTradeTransaction& trans)
    {
       ENUM_ORDER_STATE orderState = (ENUM_ORDER_STATE)HistoryOrderGetInteger(trans.order, ORDER_STATE);
       
-      if(g_ShowDebugInfo)
+      if(ShowDebugInfo)
          Print("  Состояние удаленного ордера: ", orderState);
       
       if(orderState == ORDER_STATE_FILLED)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Ордер исполнен: ", trans.order);
          // Получим position_id из истории ордера
          ulong posId = HistoryOrderGetInteger(trans.order, ORDER_POSITION_ID);
@@ -316,35 +316,35 @@ void ProcessOrderDeleteTransaction(const MqlTradeTransaction& trans)
       }
       else if(orderState == ORDER_STATE_CANCELED)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Ордер отменен: ", trans.order);
          SendOrderNotification("CANCELED", trans.order);
          
       }
       else if(orderState == ORDER_STATE_PARTIAL)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Ордер частично исполнен: ", trans.order);
          SendOrderNotification("PARTIAL", trans.order);
          // PARTIAL в истории: отложка частично исполнена
       }
       else if(orderState == ORDER_STATE_REJECTED)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Ордер отклонен: ", trans.order);
          SendOrderNotification("REJECTED", trans.order);
          
       }
       else if(orderState == ORDER_STATE_EXPIRED)
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Ордер истек: ", trans.order);
          SendOrderNotification("EXPIRED", trans.order);
          
       }
       else
       {
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("  Ордер удален: ", trans.order);
          SendOrderNotification("DELETE", trans.order);
          
@@ -357,12 +357,12 @@ void ProcessOrderDeleteTransaction(const MqlTradeTransaction& trans)
 //+------------------------------------------------------------------+
 void ProcessPositionTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& request)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Изменение позиции: ", trans.position);
    
    if(PositionSelectByTicket(trans.position))
    {
-      if(g_ShowDebugInfo)
+      if(ShowDebugInfo)
          Print("  Изменение позиции: ", trans.position);
 
       // В рамках обновлений позиции отправим событие изменения SL/TP
@@ -375,11 +375,11 @@ void ProcessPositionTransaction(const MqlTradeTransaction& trans, const MqlTrade
 //+------------------------------------------------------------------+
 void ProcessRequestTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& request)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Обработка транзакции запроса: ", trans.type);
    
    // Обрабатываем торговые запросы
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("  Тип запроса: ", trans.type);
 }
 
@@ -460,7 +460,7 @@ bool ValidateTradeData(ulong ticket, string eventType)
 //+------------------------------------------------------------------+
 void SendTradeNotification(string tradeType, ulong ticket)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Отправка уведомления: ", tradeType, " тикет: ", ticket);
    
    // Дедупликация
@@ -476,7 +476,7 @@ void SendTradeNotification(string tradeType, ulong ticket)
    
    string json = CreateStandardJSON(tradeType, ticket);
    
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("JSON готов для отправки: ", json);
    
    SendWebhookJSONWithRetry(json);
@@ -487,7 +487,7 @@ void SendTradeNotification(string tradeType, ulong ticket)
 //+------------------------------------------------------------------+
 void SendOrderNotification(string orderType, ulong ticket, ulong positionTicket = 0)
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("Отправка уведомления об ордере: ", orderType, " тикет: ", ticket);
    
    // Валидируем данные перед отправкой
@@ -499,7 +499,7 @@ void SendOrderNotification(string orderType, ulong ticket, ulong positionTicket 
    
    string json = CreateStandardJSON(orderType, ticket, positionTicket);
    
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       Print("JSON готов для отправки: ", json);
    
    SendWebhookJSONWithRetry(json);
@@ -510,7 +510,10 @@ void SendOrderNotification(string orderType, ulong ticket, ulong positionTicket 
 //+------------------------------------------------------------------+
 void SendPositionSltpUpdateNotification(ulong positionTicket)
 {
-   if(!g_SendToWebhook || g_WebhookURL == "")
+   if(!SendToWebhook || WebhookURL == "")
+      return;
+
+   if(!EnableSltpEvents || !EnablePositionEvents)
       return;
 
    // Валидация: позиция должна существовать
@@ -526,7 +529,10 @@ void SendPositionSltpUpdateNotification(ulong positionTicket)
 //+------------------------------------------------------------------+
 void SendOrderSltpUpdateNotification(ulong orderTicket)
 {
-   if(!g_SendToWebhook || g_WebhookURL == "")
+   if(!SendToWebhook || WebhookURL == "")
+      return;
+
+   if(!EnableSltpEvents || !EnableOrderEvents)
       return;
 
    // Валидация: отправляем только для активных ордеров (не для исторических)
@@ -549,9 +555,11 @@ string CreateBaseJSON(string eventType, ulong ticket)
    string json = "{";
    json += "\"event\":\"" + eventType + "\",";
    json += "\"ticket\":" + IntegerToString(ticket) + ",";
-   json += "\"timestamp\":\"" + TimeToString(TimeCurrent()) + "\",";
+   json += "\"timestamp\":\"" + ToIso8601(TimeCurrent()) + "\",";
    json += "\"account\":" + GetCachedAccountInfo() + ",";
-   json += "\"broker\":\"" + GetCachedBrokerInfo() + "\"";
+   json += "\"broker\":\"" + GetCachedBrokerInfo() + "\",";
+   json += "\"schema_version\":\"" + JSON_SCHEMA_VERSION + "\",";
+   json += "\"ea_version\":\"" + EA_VERSION + "\"";
    
    // Получаем символ, сектор и position_id в зависимости от типа события
    string symbol = "";
@@ -670,7 +678,7 @@ void PurgeOldDedupKeys()
    ArrayResize(newTimes, 0);
    for(int i=0;i<n;i++)
    {
-      if(now - g_DedupTimes[i] <= (ulong)g_DedupWindowMs)
+      if(now - g_DedupTimes[i] <= (ulong)DedupWindowMs)
       {
          int idx = ArraySize(newKeys);
          ArrayResize(newKeys, idx+1);
@@ -688,7 +696,7 @@ void PurgeOldDedupKeys()
 //+------------------------------------------------------------------+
 bool ShouldSendEvent(string eventType, ulong ticket)
 {
-   if(!g_EnableDedup)
+   if(!EnableDedup)
       return true;
 
    // Дедупликацию пока применяем только для события закрытия позиции
@@ -704,7 +712,7 @@ bool ShouldSendEvent(string eventType, ulong ticket)
       if(g_DedupKeys[i] == key)
       {
          // Уже отправляли совсем недавно – подавим дубликат
-         if(g_ShowDebugInfo)
+         if(ShowDebugInfo)
             Print("Дедуп: подавлен повтор события ", key);
          return false;
       }
@@ -739,13 +747,15 @@ string CreatePositionJSON(ulong ticket)
    if(PositionSelectByTicket(ticket))
    {
       ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      int digits = GetDigitsForSymbol(symbol);
       json += ",\"type\":\"" + ((type == POSITION_TYPE_BUY) ? "BUY" : "SELL") + "\"";
       json += ",\"volume\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2);
-      json += ",\"price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), 5);
+      json += ",\"price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits);
       json += ",\"profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 2);
       json += ",\"swap\":" + DoubleToString(PositionGetDouble(POSITION_SWAP), 2);
-      json += ",\"stop_loss\":" + DoubleToString(PositionGetDouble(POSITION_SL), 5);
-      json += ",\"take_profit\":" + DoubleToString(PositionGetDouble(POSITION_TP), 5);
+      json += ",\"stop_loss\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits);
+      json += ",\"take_profit\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits);
       json += ",\"comment\":\"" + EscapeJSONString(PositionGetString(POSITION_COMMENT)) + "\"";
    }
    return json;
@@ -760,9 +770,11 @@ string CreateDealJSON(ulong ticket, string eventType)
    if(HistoryDealSelect(ticket))
    {
       ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(ticket, DEAL_TYPE);
+      string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
+      int digits = GetDigitsForSymbol(symbol);
       json += ",\"type\":\"" + ((dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL") + "\"";
       json += ",\"volume\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_VOLUME), 2);
-      json += ",\"price\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), 5);
+      json += ",\"price\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), digits);
       json += ",\"profit\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_PROFIT), 2);
       json += ",\"swap\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_SWAP), 2);
       json += ",\"commission\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_COMMISSION), 2);
@@ -801,6 +813,7 @@ string CreateOrderJSON(ulong ticket, bool isHistorical = false)
       ENUM_ORDER_TYPE type;
       string comment;
       double volume, price, sl, tp;
+      string symbol;
       
       if(isHistorical)
       {
@@ -810,6 +823,7 @@ string CreateOrderJSON(ulong ticket, bool isHistorical = false)
          sl = HistoryOrderGetDouble(ticket, ORDER_SL);
          tp = HistoryOrderGetDouble(ticket, ORDER_TP);
          comment = HistoryOrderGetString(ticket, ORDER_COMMENT);
+         symbol = HistoryOrderGetString(ticket, ORDER_SYMBOL);
       }
       else
       {
@@ -819,13 +833,15 @@ string CreateOrderJSON(ulong ticket, bool isHistorical = false)
          sl = OrderGetDouble(ORDER_SL);
          tp = OrderGetDouble(ORDER_TP);
          comment = OrderGetString(ORDER_COMMENT);
+         symbol = OrderGetString(ORDER_SYMBOL);
       }
+      int digits = GetDigitsForSymbol(symbol);
       
       json += ",\"type\":\"" + GetOrderTypeString(type) + "\"";
       json += ",\"volume\":" + DoubleToString(volume, 2);
-      json += ",\"price\":" + DoubleToString(price, 5);
-      json += ",\"stop_loss\":" + DoubleToString(sl, 5);
-      json += ",\"take_profit\":" + DoubleToString(tp, 5);
+      json += ",\"price\":" + DoubleToString(price, digits);
+      json += ",\"stop_loss\":" + DoubleToString(sl, digits);
+      json += ",\"take_profit\":" + DoubleToString(tp, digits);
       json += ",\"comment\":\"" + EscapeJSONString(comment) + "\"";
    }
    return json;
@@ -841,17 +857,21 @@ string CreateOrderSltpUpdateJSON(ulong ticket)
    {
       double sl = OrderGetDouble(ORDER_SL);
       double tp = OrderGetDouble(ORDER_TP);
-      json += ",\"sl\":" + DoubleToString(sl, 5);
-      json += ",\"tp\":" + DoubleToString(tp, 5);
-      json += ",\"symbol\":\"" + EscapeJSONString(OrderGetString(ORDER_SYMBOL)) + "\"";
+      string symbol = OrderGetString(ORDER_SYMBOL);
+      int digits = GetDigitsForSymbol(symbol);
+      json += ",\"sl\":" + DoubleToString(sl, digits);
+      json += ",\"tp\":" + DoubleToString(tp, digits);
+      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
    }
    else if(HistoryOrderSelect(ticket))
    {
       double sl = HistoryOrderGetDouble(ticket, ORDER_SL);
       double tp = HistoryOrderGetDouble(ticket, ORDER_TP);
-      json += ",\"sl\":" + DoubleToString(sl, 5);
-      json += ",\"tp\":" + DoubleToString(tp, 5);
-      json += ",\"symbol\":\"" + EscapeJSONString(HistoryOrderGetString(ticket, ORDER_SYMBOL)) + "\"";
+      string symbol = HistoryOrderGetString(ticket, ORDER_SYMBOL);
+      int digits = GetDigitsForSymbol(symbol);
+      json += ",\"sl\":" + DoubleToString(sl, digits);
+      json += ",\"tp\":" + DoubleToString(tp, digits);
+      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
    }
    return json;
 }
@@ -866,9 +886,11 @@ string CreatePositionSltpUpdateJSON(ulong positionTicket)
    {
       double sl = PositionGetDouble(POSITION_SL);
       double tp = PositionGetDouble(POSITION_TP);
-      json += ",\"sl\":" + DoubleToString(sl, 5);
-      json += ",\"tp\":" + DoubleToString(tp, 5);
-      json += ",\"symbol\":\"" + EscapeJSONString(PositionGetString(POSITION_SYMBOL)) + "\"";
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      int digits = GetDigitsForSymbol(symbol);
+      json += ",\"sl\":" + DoubleToString(sl, digits);
+      json += ",\"tp\":" + DoubleToString(tp, digits);
+      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
    }
    return json;
 }
@@ -881,8 +903,10 @@ string CreatePositionInfoJSON(ulong positionTicket)
    string json = "";
    if(PositionSelectByTicket(positionTicket))
    {
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      int digits = GetDigitsForSymbol(symbol);
       json += ",\"position_ticket\":" + IntegerToString(positionTicket);
-      json += ",\"position_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), 5);
+      json += ",\"position_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits);
       json += ",\"position_profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 2);
    }
    return json;
@@ -975,7 +999,7 @@ bool SendWebhookJSONWithRetry(string jsonData)
 //+------------------------------------------------------------------+
 bool SendWebhookJSON(string jsonData)
 {
-   if(!g_SendToWebhook || g_WebhookURL == "")
+   if(!SendToWebhook || WebhookURL == "")
       return false;
       
    // Очищаем JSON от лишних символов
@@ -992,7 +1016,7 @@ bool SendWebhookJSON(string jsonData)
       return false;
    }
    
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
    {
       Print("Очищенный JSON:", cleanJson);
    }
@@ -1001,7 +1025,7 @@ bool SendWebhookJSON(string jsonData)
    char post[], result[];
    
    StringToCharArray(cleanJson, post, 0, StringLen(cleanJson), CP_UTF8);
-   int res = WebRequest("POST", g_WebhookURL, headers, g_WebhookTimeout, post, result, headers);
+   int res = WebRequest("POST", WebhookURL, headers, WebhookTimeout, post, result, headers);
    
    // Получаем ответ сервера в UTF-8
    string serverResponse = CharArrayToString(result, 0, ArraySize(result), CP_UTF8);
@@ -1024,18 +1048,18 @@ bool SendWebhookJSON(string jsonData)
    {
       LogError("✗ Ошибка -1: URL не добавлен в разрешенные адреса");
       LogError("  → Решение: Сервис -> Настройки -> Советники -> Добавить URL");
-      LogError("  → URL: " + g_WebhookURL);
+      LogError("  → URL: " + WebhookURL);
    }
    else if(res == -2)
    {
       LogError("✗ Ошибка -2: Неверный URL");
-      LogError("  → Проверьте правильность URL: " + g_WebhookURL);
+      LogError("  → Проверьте правильность URL: " + WebhookURL);
       LogError("  → URL должен начинаться с http:// или https://");
    }
    else if(res == -3)
    {
       LogError("✗ Ошибка -3: Таймаут запроса");
-      LogError("  → Текущий таймаут: " + IntegerToString(g_WebhookTimeout) + " мс");
+      LogError("  → Текущий таймаут: " + IntegerToString(WebhookTimeout) + " мс");
       LogError("  → Попробуйте увеличить значение WebhookTimeout");
    }
    else if(res == -4)
@@ -1043,14 +1067,14 @@ bool SendWebhookJSON(string jsonData)
       LogError("✗ Ошибка -4: Неверный HTTP-код ответа");
       LogError("  → Сервер вернул некорректный HTTP-код");
       LogError("  → Ответ сервера: " + serverResponse);
-      LogError("  → Проверьте доступность сервера: " + g_WebhookURL);
+      LogError("  → Проверьте доступность сервера: " + WebhookURL);
    }
    else
    {
       LogError("✗ Неизвестная ошибка отправки. Код: " + IntegerToString(res));
       LogError("  → Ответ сервера: " + serverResponse);
       LogError("  → Проверьте подключение к интернету");
-      LogError("  → Проверьте доступность сервера: " + g_WebhookURL);
+      LogError("  → Проверьте доступность сервера: " + WebhookURL);
    }
    
    return false;
@@ -1063,7 +1087,7 @@ bool SendWebhookJSON(string jsonData)
 //+------------------------------------------------------------------+
 void ForceCheckClosedTrades()
 {
-   if(g_ShowDebugInfo)
+   if(ShowDebugInfo)
       LogInfo("Принудительная проверка закрытых сделок");
    
    // Реализация проверки закрытых сделок
@@ -1098,6 +1122,16 @@ void LogWarning(string message, string details = "")
    if(details != "")
       logMessage += " | " + details;
    
+   Print(logMessage);
+}
+
+void LogDebug(string message, string details = "")
+{
+   if(!ShowDebugInfo)
+      return;
+   string logMessage = TimeToString(TimeCurrent()) + " DEBUG: " + message;
+   if(details != "")
+      logMessage += " | " + details;
    Print(logMessage);
 }
 
@@ -1184,6 +1218,28 @@ string EscapeJSONString(string text)
    return result;
 }
 
+//+------------------------------------------------------------------+
+//| Форматирование времени в ISO-8601 (UTC, с Z)                      |
+//+------------------------------------------------------------------+
+string ToIso8601(datetime t)
+{
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   // Используем локальное время терминала; при желании можно TimeGMT()
+   return StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ",
+                       dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+}
+
+//+------------------------------------------------------------------+
+//| Получение точности цены для символа                               |
+//+------------------------------------------------------------------+
+int GetDigitsForSymbol(string symbol)
+{
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(digits <= 0) digits = 5; // запасной вариант
+   return digits;
+}
+
 
 
 //+------------------------------------------------------------------+
@@ -1191,7 +1247,7 @@ string EscapeJSONString(string text)
 //+------------------------------------------------------------------+
 void CheckWebhookURL()
 {
-   if(StringFind(g_WebhookURL, "http://") != 0 && StringFind(g_WebhookURL, "https://") != 0)
+   if(StringFind(WebhookURL, "http://") != 0 && StringFind(WebhookURL, "https://") != 0)
    {
       LogError("URL должен начинаться с http:// или https://");
       return;
@@ -1199,7 +1255,7 @@ void CheckWebhookURL()
    
 
    
-   LogInfo("URL: " + g_WebhookURL);
+   LogInfo("URL: " + WebhookURL);
 }
 
 //+------------------------------------------------------------------+
@@ -1210,11 +1266,13 @@ void TestWebhookConnection()
    // Создаем тестовый JSON
    string testJson = "{";
    testJson += "\"event\":\"test\",";
-   testJson += "\"timestamp\":\"" + TimeToString(TimeCurrent()) + "\",";
+   testJson += "\"timestamp\":\"" + ToIso8601(TimeCurrent()) + "\",";
    testJson += "\"message\":\"" + EscapeJSONString("Тестовое соединение от MT5 Webhook Expert") + "\",";
    testJson += "\"account\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",";
    testJson += "\"symbol\":\"" + EscapeJSONString(Symbol()) + "\",";
-   testJson += "\"sector\":" + IntegerToString(GetSymbolSector(Symbol()));
+   testJson += "\"sector\":" + IntegerToString(GetSymbolSector(Symbol())) + ",";
+   testJson += "\"schema_version\":\"" JSON_SCHEMA_VERSION "\",";
+   testJson += "\"ea_version\":\"" EA_VERSION "\"";
    testJson += "}";
    
    if(SendWebhookJSON(testJson))
