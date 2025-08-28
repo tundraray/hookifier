@@ -413,7 +413,7 @@ void SendTradeNotification(string tradeType, ulong ticket)
 }
 
 //+------------------------------------------------------------------+
-//| Отправка уведомления об отложенном ордере                         |
+//| Отправка уведомления об отложенном ордере                        |
 //+------------------------------------------------------------------+
 void SendOrderNotification(string orderType, ulong ticket, ulong positionTicket = 0)
 {
@@ -436,7 +436,7 @@ void SendOrderNotification(string orderType, ulong ticket, ulong positionTicket 
 }
 
 //+------------------------------------------------------------------+
-//| Отправка события обновления SL/TP позиции                         |
+//| Отправка события обновления SL/TP позиции                        |
 //+------------------------------------------------------------------+
 void SendPositionSltpUpdateNotification(ulong positionTicket)
 {
@@ -455,7 +455,7 @@ void SendPositionSltpUpdateNotification(ulong positionTicket)
 }
 
 //+------------------------------------------------------------------+
-//| Отправка события обновления SL/TP ордера                          |
+//| Отправка события обновления SL/TP ордера                         |
 //+------------------------------------------------------------------+
 void SendOrderSltpUpdateNotification(ulong orderTicket)
 {
@@ -481,7 +481,7 @@ void SendOrderSltpUpdateNotification(ulong orderTicket)
 
 
 //+------------------------------------------------------------------+
-//| Получение строкового представления типа ордера                    |
+//| Получение строкового представления типа ордера                   |
 //+------------------------------------------------------------------+
 string GetOrderTypeString(ENUM_ORDER_TYPE orderType)
 {
