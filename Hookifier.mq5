@@ -12,6 +12,12 @@
 #define JSON_SCHEMA_VERSION "1.0"
 #define EA_VERSION          "1.21"
 
+#include "logger.mqh"
+#include "utils.mqh"
+#include "dedup.mqh"
+#include "webhook_client.mqh"
+#include "json_builder.mqh"
+
 //--- Входные параметры
 input group   "=== Настройки вебхука ==="
 input bool     SendToWebhook = true;    // Отправлять данные на вебхук
@@ -35,14 +41,7 @@ input int      DedupWindowMs = 600;     // Окно дедупликации (м
 
 
 
-// Кэш для часто используемых данных
-string cachedAccountInfo = "";
-string cachedBrokerInfo = "";
-
-// Дедупликация событий (in-memory)
-string g_DedupKeys[];
-ulong  g_DedupTimes[];
-int    g_DedupMaxSize = 256;
+// Кэш и дедуп теперь в utils.mqh и dedup.mqh
 
 
 //+------------------------------------------------------------------+
@@ -160,41 +159,22 @@ void OnTimer()
 //+------------------------------------------------------------------+
 //| Инициализация кэша                                               |
 //+------------------------------------------------------------------+
-void InitializeCache()
-{
-   cachedAccountInfo = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
-   cachedBrokerInfo = EscapeJSONString(AccountInfoString(ACCOUNT_COMPANY));
-   ArrayResize(g_DedupKeys, 0);
-   ArrayResize(g_DedupTimes, 0);
-}
+void InitializeCache();
 
 //+------------------------------------------------------------------+
 //| Получение кэшированной информации об аккаунте                    |
 //+------------------------------------------------------------------+
-string GetCachedAccountInfo()
-{
-   if(cachedAccountInfo == "")
-      cachedAccountInfo = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
-   return cachedAccountInfo;
-}
+string GetCachedAccountInfo();
 
 //+------------------------------------------------------------------+
 //| Получение кэшированной информации о брокере                      |
 //+------------------------------------------------------------------+
-string GetCachedBrokerInfo()
-{
-   if(cachedBrokerInfo == "")
-      cachedBrokerInfo = EscapeJSONString(AccountInfoString(ACCOUNT_COMPANY));
-   return cachedBrokerInfo;
-}
+string GetCachedBrokerInfo();
 
 //+------------------------------------------------------------------+
 //| Получение сектора символа                                        |
 //+------------------------------------------------------------------+
-int GetSymbolSector(string symbol)
-{
-   return (int)SymbolInfoInteger(symbol, SYMBOL_SECTOR);
-}
+int GetSymbolSector(string symbol);
 
 
 
@@ -550,411 +530,57 @@ void SendOrderSltpUpdateNotification(ulong orderTicket)
 //+------------------------------------------------------------------+
 //| Создание базового JSON для всех событий                           |
 //+------------------------------------------------------------------+
-string CreateBaseJSON(string eventType, ulong ticket)
-{
-   string json = "{";
-   json += "\"event\":\"" + eventType + "\",";
-   json += "\"ticket\":" + IntegerToString(ticket) + ",";
-   json += "\"timestamp\":\"" + ToIso8601(TimeCurrent()) + "\",";
-   json += "\"account\":" + GetCachedAccountInfo() + ",";
-   json += "\"broker\":\"" + GetCachedBrokerInfo() + "\",";
-   json += "\"schema_version\":\"" + JSON_SCHEMA_VERSION + "\",";
-   json += "\"ea_version\":\"" + EA_VERSION + "\"";
-   
-   // Получаем символ, сектор и position_id в зависимости от типа события
-   string symbol = "";
-   int sector = 0;
-   ulong positionID = 0;
-   
-   if(eventType == "OPEN")
-   {
-      if(PositionSelectByTicket(ticket))
-      {
-         symbol = PositionGetString(POSITION_SYMBOL);
-         sector = GetSymbolSector(symbol);
-         positionID = ticket; // Для открытия позиции ticket уже является position_id
-      }
-   }
-   else if(eventType == "CLOSE" || eventType == "PARTIAL_CLOSE")
-   {
-      if(HistoryDealSelect(ticket))
-      {
-         symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
-         sector = GetSymbolSector(symbol);
-         positionID = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
-      }
-   }
-   else if(eventType == "PENDING")
-   {
-      if(OrderSelect(ticket))
-      {
-         symbol = OrderGetString(ORDER_SYMBOL);
-         sector = GetSymbolSector(symbol);
-         positionID = OrderGetInteger(ORDER_POSITION_ID);
-      }
-   }
-   else if(eventType == "ACTIVATED" || eventType == "DELETE" || eventType == "CANCELED" || 
-           eventType == "PARTIAL" || eventType == "REJECTED" || eventType == "EXPIRED")
-   {
-      if(HistoryOrderSelect(ticket))
-      {
-         symbol = HistoryOrderGetString(ticket, ORDER_SYMBOL);
-         sector = GetSymbolSector(symbol);
-         positionID = HistoryOrderGetInteger(ticket, ORDER_POSITION_ID);
-      }
-   }
-   
-   // Добавляем информацию о символе и секторе
-   if(symbol != "")
-   {
-      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
-      json += ",\"sector\": \"" + EnumToString((ENUM_SYMBOL_SECTOR)sector) + "\"";;
-   }
-   
-   // Добавляем position_id если он найден
-   if(positionID != 0)
-   {
-      // Для открытия позиции ticket уже является position_id
-      json += ",\"position_id\":" + IntegerToString(positionID);
-   }
-   else if(eventType == "CLOSE" || eventType == "PARTIAL_CLOSE")
-   {
-      // Для сделок получаем position_id из сделки
-      if(HistoryDealSelect(ticket))
-      {
-         ulong positionTicket = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
-         if(positionTicket != 0)
-            json += ",\"position_id\":" + IntegerToString(positionTicket);
-      }
-   }
-   else if(eventType == "PENDING" || eventType == "ACTIVATED" || eventType == "DELETE" || 
-           eventType == "CANCELED" || eventType == "PARTIAL" || eventType == "REJECTED" || eventType == "EXPIRED")
-   {
-      // Для ордеров получаем position_id из ордера
-      bool orderSelected = false;
-      if(eventType == "PENDING")
-         orderSelected = OrderSelect(ticket);
-      else
-         orderSelected = HistoryOrderSelect(ticket);
-         
-      if(orderSelected)
-      {
-         ulong orderPositionID = 0;
-         if(eventType == "PENDING")
-            orderPositionID = OrderGetInteger(ORDER_POSITION_ID);
-         else
-            orderPositionID = HistoryOrderGetInteger(ticket, ORDER_POSITION_ID);
-            
-         if(orderPositionID != 0)
-            json += ",\"position_id\":" + IntegerToString(orderPositionID);
-      }
-   }
-   
-   return json;
-}
+string CreateBaseJSON(string eventType, ulong ticket);
 
 //+------------------------------------------------------------------+
 //| Дедупликация: хэш события                                         |
 //+------------------------------------------------------------------+
-string BuildEventKey(string eventType, ulong ticket)
-{
-   // Составной ключ: тип + тикет. Можно расширить (symbol/position_id) при необходимости
-   return eventType + ":" + IntegerToString((long)ticket);
-}
+string BuildEventKey(string eventType, ulong ticket);
 
 //+------------------------------------------------------------------+
 //| Дедупликация: очистка устаревших ключей                           |
 //+------------------------------------------------------------------+
-void PurgeOldDedupKeys()
-{
-   ulong now = GetTickCount64();
-   int n = ArraySize(g_DedupKeys);
-   if(n == 0)
-      return;
-   // Составим новые массивы без устаревших
-   string newKeys[];
-   ulong  newTimes[];
-   ArrayResize(newKeys, 0);
-   ArrayResize(newTimes, 0);
-   for(int i=0;i<n;i++)
-   {
-      if(now - g_DedupTimes[i] <= (ulong)DedupWindowMs)
-      {
-         int idx = ArraySize(newKeys);
-         ArrayResize(newKeys, idx+1);
-         ArrayResize(newTimes, idx+1);
-         newKeys[idx] = g_DedupKeys[i];
-         newTimes[idx] = g_DedupTimes[i];
-      }
-   }
-   g_DedupKeys = newKeys;
-   g_DedupTimes = newTimes;
-}
+void PurgeOldDedupKeys();
 
 //+------------------------------------------------------------------+
 //| Дедупликация: проверка и запись события                           |
 //+------------------------------------------------------------------+
-bool ShouldSendEvent(string eventType, ulong ticket)
-{
-   if(!EnableDedup)
-      return true;
-
-   // Дедупликацию пока применяем только для события закрытия позиции
-   if(eventType != "CLOSE")
-      return true;
-
-   PurgeOldDedupKeys();
-
-   string key = BuildEventKey(eventType, ticket);
-   int n = ArraySize(g_DedupKeys);
-   for(int i=0;i<n;i++)
-   {
-      if(g_DedupKeys[i] == key)
-      {
-         // Уже отправляли совсем недавно – подавим дубликат
-         if(ShowDebugInfo)
-            Print("Дедуп: подавлен повтор события ", key);
-         return false;
-      }
-   }
-   // Добавим ключ
-   if(n >= g_DedupMaxSize)
-   {
-      // Уберем самый старый (голову)
-      // Сдвиг вручную
-      for(int j=1;j<n;j++)
-      {
-         g_DedupKeys[j-1] = g_DedupKeys[j];
-         g_DedupTimes[j-1] = g_DedupTimes[j];
-      }
-      n--;
-      ArrayResize(g_DedupKeys, n);
-      ArrayResize(g_DedupTimes, n);
-   }
-   ArrayResize(g_DedupKeys, n+1);
-   ArrayResize(g_DedupTimes, n+1);
-   g_DedupKeys[n] = key;
-   g_DedupTimes[n] = GetTickCount64();
-   return true;
-}
+bool ShouldSendEvent(string eventType, ulong ticket);
 
 //+------------------------------------------------------------------+
 //| Создание JSON для позиции                                         |
 //+------------------------------------------------------------------+
-string CreatePositionJSON(ulong ticket)
-{
-   string json = "";
-   if(PositionSelectByTicket(ticket))
-   {
-      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      int digits = GetDigitsForSymbol(symbol);
-      json += ",\"type\":\"" + ((type == POSITION_TYPE_BUY) ? "BUY" : "SELL") + "\"";
-      json += ",\"volume\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2);
-      json += ",\"price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits);
-      json += ",\"profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 2);
-      json += ",\"swap\":" + DoubleToString(PositionGetDouble(POSITION_SWAP), 2);
-      json += ",\"stop_loss\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits);
-      json += ",\"take_profit\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits);
-      json += ",\"comment\":\"" + EscapeJSONString(PositionGetString(POSITION_COMMENT)) + "\"";
-   }
-   return json;
-}
+string CreatePositionJSON(ulong ticket);
 
 //+------------------------------------------------------------------+
 //| Создание JSON для сделки                                          |
 //+------------------------------------------------------------------+
-string CreateDealJSON(ulong ticket, string eventType)
-{
-   string json = "";
-   if(HistoryDealSelect(ticket))
-   {
-      ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(ticket, DEAL_TYPE);
-      string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
-      int digits = GetDigitsForSymbol(symbol);
-      json += ",\"type\":\"" + ((dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL") + "\"";
-      json += ",\"volume\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_VOLUME), 2);
-      json += ",\"price\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), digits);
-      json += ",\"profit\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_PROFIT), 2);
-      json += ",\"swap\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_SWAP), 2);
-      json += ",\"commission\":" + DoubleToString(HistoryDealGetDouble(ticket, DEAL_COMMISSION), 2);
-      
-      // Добавляем общий профит для событий закрытия
-      if(eventType == "CLOSE" || eventType == "PARTIAL_CLOSE")
-      {
-         double totalProfit = HistoryDealGetDouble(ticket, DEAL_PROFIT) + 
-                             HistoryDealGetDouble(ticket, DEAL_SWAP) + 
-                             HistoryDealGetDouble(ticket, DEAL_COMMISSION);
-         json += ",\"total_profit\":" + DoubleToString(totalProfit, 2);
-      }
-      json += ",\"comment\":\"" + EscapeJSONString(HistoryDealGetString(ticket, DEAL_COMMENT)) + "\"";
-      
-      if(eventType == "PARTIAL_CLOSE")
-         json += ",\"partial_close\":true";
-   }
-   return json;
-}
+string CreateDealJSON(ulong ticket, string eventType);
 
 //+------------------------------------------------------------------+
 //| Создание JSON для ордера                                          |
 //+------------------------------------------------------------------+
-string CreateOrderJSON(ulong ticket, bool isHistorical = false)
-{
-   string json = "";
-   bool orderSelected = false;
-   
-   if(isHistorical)
-      orderSelected = HistoryOrderSelect(ticket);
-   else
-      orderSelected = OrderSelect(ticket);
-   
-   if(orderSelected)
-   {
-      ENUM_ORDER_TYPE type;
-      string comment;
-      double volume, price, sl, tp;
-      string symbol;
-      
-      if(isHistorical)
-      {
-         type = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(ticket, ORDER_TYPE);
-         volume = HistoryOrderGetDouble(ticket, ORDER_VOLUME_INITIAL);
-         price = HistoryOrderGetDouble(ticket, ORDER_PRICE_OPEN);
-         sl = HistoryOrderGetDouble(ticket, ORDER_SL);
-         tp = HistoryOrderGetDouble(ticket, ORDER_TP);
-         comment = HistoryOrderGetString(ticket, ORDER_COMMENT);
-         symbol = HistoryOrderGetString(ticket, ORDER_SYMBOL);
-      }
-      else
-      {
-         type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         volume = OrderGetDouble(ORDER_VOLUME_INITIAL);
-         price = OrderGetDouble(ORDER_PRICE_OPEN);
-         sl = OrderGetDouble(ORDER_SL);
-         tp = OrderGetDouble(ORDER_TP);
-         comment = OrderGetString(ORDER_COMMENT);
-         symbol = OrderGetString(ORDER_SYMBOL);
-      }
-      int digits = GetDigitsForSymbol(symbol);
-      
-      json += ",\"type\":\"" + GetOrderTypeString(type) + "\"";
-      json += ",\"volume\":" + DoubleToString(volume, 2);
-      json += ",\"price\":" + DoubleToString(price, digits);
-      json += ",\"stop_loss\":" + DoubleToString(sl, digits);
-      json += ",\"take_profit\":" + DoubleToString(tp, digits);
-      json += ",\"comment\":\"" + EscapeJSONString(comment) + "\"";
-   }
-   return json;
-}
+string CreateOrderJSON(ulong ticket, bool isHistorical = false);
 
 //+------------------------------------------------------------------+
 //| JSON для обновления SL/TP ордера                                 |
 //+------------------------------------------------------------------+
-string CreateOrderSltpUpdateJSON(ulong ticket)
-{
-   string json = "";
-   if(OrderSelect(ticket))
-   {
-      double sl = OrderGetDouble(ORDER_SL);
-      double tp = OrderGetDouble(ORDER_TP);
-      string symbol = OrderGetString(ORDER_SYMBOL);
-      int digits = GetDigitsForSymbol(symbol);
-      json += ",\"sl\":" + DoubleToString(sl, digits);
-      json += ",\"tp\":" + DoubleToString(tp, digits);
-      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
-   }
-   else if(HistoryOrderSelect(ticket))
-   {
-      double sl = HistoryOrderGetDouble(ticket, ORDER_SL);
-      double tp = HistoryOrderGetDouble(ticket, ORDER_TP);
-      string symbol = HistoryOrderGetString(ticket, ORDER_SYMBOL);
-      int digits = GetDigitsForSymbol(symbol);
-      json += ",\"sl\":" + DoubleToString(sl, digits);
-      json += ",\"tp\":" + DoubleToString(tp, digits);
-      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
-   }
-   return json;
-}
+string CreateOrderSltpUpdateJSON(ulong ticket);
 
 //+------------------------------------------------------------------+
 //| JSON для обновления SL/TP позиции                                 |
 //+------------------------------------------------------------------+
-string CreatePositionSltpUpdateJSON(ulong positionTicket)
-{
-   string json = "";
-   if(PositionSelectByTicket(positionTicket))
-   {
-      double sl = PositionGetDouble(POSITION_SL);
-      double tp = PositionGetDouble(POSITION_TP);
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      int digits = GetDigitsForSymbol(symbol);
-      json += ",\"sl\":" + DoubleToString(sl, digits);
-      json += ",\"tp\":" + DoubleToString(tp, digits);
-      json += ",\"symbol\":\"" + EscapeJSONString(symbol) + "\"";
-   }
-   return json;
-}
+string CreatePositionSltpUpdateJSON(ulong positionTicket);
 
 //+------------------------------------------------------------------+
 //| Создание JSON для информации о позиции                            |
 //+------------------------------------------------------------------+
-string CreatePositionInfoJSON(ulong positionTicket)
-{
-   string json = "";
-   if(PositionSelectByTicket(positionTicket))
-   {
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      int digits = GetDigitsForSymbol(symbol);
-      json += ",\"position_ticket\":" + IntegerToString(positionTicket);
-      json += ",\"position_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits);
-      json += ",\"position_profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 2);
-   }
-   return json;
-}
+string CreatePositionInfoJSON(ulong positionTicket);
 
 //+------------------------------------------------------------------+
 //| Создание стандартизированного JSON для всех типов событий         |
 //+------------------------------------------------------------------+
-string CreateStandardJSON(string eventType, ulong ticket, ulong positionTicket = 0)
-{
-   string json = CreateBaseJSON(eventType, ticket);
-   
-   if(eventType == "OPEN")
-   {
-      json += CreatePositionJSON(ticket);
-   }
-   else if(eventType == "CLOSE" || eventType == "PARTIAL_CLOSE")
-   {
-      json += CreateDealJSON(ticket, eventType);
-   }
-   else if(eventType == "PENDING")
-   {
-      json += CreateOrderJSON(ticket, false);
-   }
-   else if(eventType == "ACTIVATED")
-   {
-      json += CreateOrderJSON(ticket, true);
-      if(positionTicket != 0)
-         json += CreatePositionInfoJSON(positionTicket);
-   }
-   else if(eventType == "ORDER_SLTP_UPDATE")
-   {
-      json += CreateOrderSltpUpdateJSON(ticket);
-   }
-   else if(eventType == "POSITION_SLTP_UPDATE")
-   {
-      json += CreatePositionSltpUpdateJSON(ticket);
-   }
-   else if(eventType == "DELETE" || eventType == "CANCELED" || eventType == "PARTIAL" || eventType == "REJECTED" || eventType == "EXPIRED")
-   {
-      json += CreateOrderJSON(ticket, true);
-      if(eventType != "DELETE")
-         json += ",\"state\":\"" + eventType + "\"";
-   }
-   
-   json += "}";
-   return json;
-}
+string CreateStandardJSON(string eventType, ulong ticket, ulong positionTicket = 0);
 
 
 
@@ -978,107 +604,12 @@ string GetOrderTypeString(ENUM_ORDER_TYPE orderType)
 //+------------------------------------------------------------------+
 //| Отправка JSON на вебхук с повторными попытками                   |
 //+------------------------------------------------------------------+
-bool SendWebhookJSONWithRetry(string jsonData)
-{
-   for(int attempt = 1; attempt <= MaxRetries; attempt++)
-   {
-      if(SendWebhookJSON(jsonData))
-         return true;
-      
-      if(attempt < MaxRetries)
-      {
-         LogWarning("Попытка " + IntegerToString(attempt) + " не удалась, повтор через " + IntegerToString(RetryDelay) + " мс");
-         Sleep(RetryDelay);
-      }
-   }
-   return false;
-}
+bool SendWebhookJSONWithRetry(string jsonData);
 
 //+------------------------------------------------------------------+
 //| Универсальная функция отправки JSON на вебхук                    |
 //+------------------------------------------------------------------+
-bool SendWebhookJSON(string jsonData)
-{
-   if(!SendToWebhook || WebhookURL == "")
-      return false;
-      
-   // Очищаем JSON от лишних символов
-   string cleanJson = jsonData;
-   StringTrimRight(cleanJson);
-   StringTrimLeft(cleanJson);
-   
-   // Проверяем валидность JSON
-   if(!IsValidJSON(cleanJson))
-   {
-      LogError("✗ Ошибка: Неверный формат JSON");
-      LogError("  → Очищенный JSON: " + cleanJson);
-      LogError("  → Длина JSON: " + IntegerToString(StringLen(cleanJson)));
-      return false;
-   }
-   
-   if(ShowDebugInfo)
-   {
-      Print("Очищенный JSON:", cleanJson);
-   }
-      
-   string headers = "Content-Type: application/json; charset=utf-8\r\n";
-   char post[], result[];
-   
-   StringToCharArray(cleanJson, post, 0, StringLen(cleanJson), CP_UTF8);
-   int res = WebRequest("POST", WebhookURL, headers, WebhookTimeout, post, result, headers);
-   
-   // Получаем ответ сервера в UTF-8
-   string serverResponse = CharArrayToString(result, 0, ArraySize(result), CP_UTF8);
-   
-   if(res == 200)
-   {
-      LogInfo("✓ JSON успешно отправлен на вебхук");
-      return true;
-   }
-   else if(res == 422)
-   {
-      LogError("✗ Ошибка 422: Неверный формат данных");
-      LogError("  → HTTP Status: 422 Unprocessable Entity");
-      LogError("  → Сервер не может обработать запрос из-за неправильного формата");
-      LogError("  → Отправленный JSON: " + jsonData);
-      LogError("  → Ответ сервера: " + serverResponse);
-      LogError("  → Проверьте формат данных на вашем сервере");
-   }
-   else if(res == -1)
-   {
-      LogError("✗ Ошибка -1: URL не добавлен в разрешенные адреса");
-      LogError("  → Решение: Сервис -> Настройки -> Советники -> Добавить URL");
-      LogError("  → URL: " + WebhookURL);
-   }
-   else if(res == -2)
-   {
-      LogError("✗ Ошибка -2: Неверный URL");
-      LogError("  → Проверьте правильность URL: " + WebhookURL);
-      LogError("  → URL должен начинаться с http:// или https://");
-   }
-   else if(res == -3)
-   {
-      LogError("✗ Ошибка -3: Таймаут запроса");
-      LogError("  → Текущий таймаут: " + IntegerToString(WebhookTimeout) + " мс");
-      LogError("  → Попробуйте увеличить значение WebhookTimeout");
-   }
-   else if(res == -4)
-   {
-      LogError("✗ Ошибка -4: Неверный HTTP-код ответа");
-      LogError("  → Сервер вернул некорректный HTTP-код");
-      LogError("  → Ответ сервера: " + serverResponse);
-      LogError("  → Проверьте доступность сервера: " + WebhookURL);
-   }
-   else
-   {
-      LogError("✗ Неизвестная ошибка отправки. Код: " + IntegerToString(res));
-      LogError("  → Ответ сервера: " + serverResponse);
-      LogError("  → Проверьте подключение к интернету");
-      LogError("  → Проверьте доступность сервера: " + WebhookURL);
-   }
-   
-   return false;
-}
+bool SendWebhookJSON(string jsonData);
 
 
 
@@ -1245,42 +776,9 @@ int GetDigitsForSymbol(string symbol)
 //+------------------------------------------------------------------+
 //| Проверка URL вебхука                                             |
 //+------------------------------------------------------------------+
-void CheckWebhookURL()
-{
-   if(StringFind(WebhookURL, "http://") != 0 && StringFind(WebhookURL, "https://") != 0)
-   {
-      LogError("URL должен начинаться с http:// или https://");
-      return;
-   }
-   
-
-   
-   LogInfo("URL: " + WebhookURL);
-}
+void CheckWebhookURL();
 
 //+------------------------------------------------------------------+
 //| Тестирование соединения с вебхуком                               |
 //+------------------------------------------------------------------+
-void TestWebhookConnection()
-{
-   // Создаем тестовый JSON
-   string testJson = "{";
-   testJson += "\"event\":\"test\",";
-   testJson += "\"timestamp\":\"" + ToIso8601(TimeCurrent()) + "\",";
-   testJson += "\"message\":\"" + EscapeJSONString("Тестовое соединение от MT5 Webhook Expert") + "\",";
-   testJson += "\"account\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",";
-   testJson += "\"symbol\":\"" + EscapeJSONString(Symbol()) + "\",";
-   testJson += "\"sector\":" + IntegerToString(GetSymbolSector(Symbol())) + ",";
-   testJson += "\"schema_version\":\"" JSON_SCHEMA_VERSION "\",";
-   testJson += "\"ea_version\":\"" EA_VERSION "\"";
-   testJson += "}";
-   
-   if(SendWebhookJSON(testJson))
-   {
-      LogInfo("✓ Соединение с вебхуком установлено");
-   }
-   else
-   {
-      LogError("✗ Не удалось установить соединение с вебхуком");
-   }
-}
+void TestWebhookConnection();
