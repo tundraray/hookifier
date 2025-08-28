@@ -21,7 +21,7 @@
 //--- Входные параметры
 input group   "=== Настройки вебхука ==="
 input bool     SendToWebhook = true;    // Отправлять данные на вебхук
-input string   WebhookURL = "https://n8n.unitup.space/webhook/80c71305-bf08-47fd-aaef-2977d3134a3d";          // URL вашего вебхука
+input string   WebhookURL = "https://n8n.unitup.space/webhook/101f7c01-18ab-4b20-802e-ceb7bf26ea7a";          // URL вашего вебхука
 input int      WebhookTimeout = 5000;    // Таймаут вебхука в миллисекундах
 
 input group   "=== Дополнительные настройки ==="
