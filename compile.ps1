@@ -9,9 +9,17 @@
     Path to the source MQL5 file to compile (optional, auto-detected if not specified)
 .PARAMETER MetaEditorPath
     Path to MetaEditor executable (optional, auto-detected if not specified)
+.PARAMETER WebhookURL
+    Override webhook URL in the source file for this build
+.PARAMETER BuildConfig
+    Build configuration name (default, production, test, dev, etc.)
+.PARAMETER NoBackup
+    Skip creating backup of original source file before modification
 .EXAMPLE
     .\compile.ps1
     .\compile.ps1 -SourceFile ".\Hookifier.mq5"
+    .\compile.ps1 -WebhookURL "https://my-test-webhook.com/endpoint"
+    .\compile.ps1 -BuildConfig "production" -WebhookURL "https://prod-webhook.com/endpoint"
     .\compile.ps1 -SourceFile ".\Hookifier.mq5" -MetaEditorPath "C:\Custom\Path\metaeditor64.exe"
 #>
 
@@ -20,7 +28,16 @@ param(
     [string]$SourceFile,
     
     [Parameter(Mandatory=$false)]
-    [string]$MetaEditorPath
+    [string]$MetaEditorPath,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$WebhookURL,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$BuildConfig = "default",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$NoBackup
 )
 
 # Function for logging
@@ -75,6 +92,15 @@ if (-not (Test-Path $SourceFile)) {
 }
 
 $SourceFile = Resolve-Path $SourceFile
+
+# Check for spaces in path (MetaEditor issue)
+if ($SourceFile.ToString().Contains(" ")) {
+    Write-Log "ERROR! File path contains SPACES! MetaEditor cannot compile!" "ERROR"
+    Write-Log "Path: $SourceFile" "ERROR"
+    Write-Log "Please move files to path without spaces" "ERROR"
+    exit 1
+}
+
 Write-Log "Source file: $SourceFile"
 
 # Auto-detect MetaEditor if path not specified
@@ -124,10 +150,47 @@ $sourceInfo = Get-Item $SourceFile
 $baseName = $sourceInfo.BaseName
 $sourceDir = $sourceInfo.Directory.FullName
 
+# Handle build parameters
+$buildSuffix = ""
+$tempSourceFile = $SourceFile
+$needsCleanup = $false
+
+if ($WebhookURL -or $BuildConfig -ne "default") {
+    if ($BuildConfig -ne "default") {
+        $buildSuffix = "-$BuildConfig"
+    }
+    
+    # Create temporary source file with modifications
+    $tempSourceFile = Join-Path $sourceDir "$baseName.build.mq5"
+    $needsCleanup = $true
+    
+    $modifiedContent = $content
+    
+    if ($WebhookURL) {
+        Write-Log "Setting webhook URL: $WebhookURL"
+        $modifiedContent = $modifiedContent -replace 'input\s+string\s+WebhookURL\s*=\s*"[^"]*"', "input string   WebhookURL = `"$WebhookURL`""
+    }
+    
+    # Write modified content to temporary file
+    $modifiedContent | Out-File -FilePath $tempSourceFile -Encoding UTF8
+    Write-Log "Created temporary build file: $($baseName).build.mq5"
+}
+
 # Create versioned name
-$versionedName = "$baseName-$version"
-$compiledFile = Join-Path $sourceDir "$baseName.ex5"
-$versionedFile = Join-Path $sourceDir "$versionedName.ex5"
+$versionedName = "$baseName-$version$buildSuffix"
+
+# Code is already in Advisors folder, compile to current directory
+$currentDir = $sourceDir
+
+# If using temp file, the compiled file will have temp name
+$tempBaseName = if ($needsCleanup) { "$baseName.build" } else { $baseName }
+$compiledFile = Join-Path $currentDir "$tempBaseName.ex5"
+$finalCompiledFile = Join-Path $currentDir "$baseName.ex5"
+$versionedFile = Join-Path $currentDir "$versionedName.ex5"
+
+# Stop MetaTrader terminal to ensure it sees new compiled version
+Write-Log "Stopping MetaTrader terminal if running..."
+Get-Process -Name terminal64 -ErrorAction SilentlyContinue | Where-Object {$_.Id -gt 0} | Stop-Process
 
 Write-Log "Compiling file..."
 Write-Log "Source: $($sourceInfo.Name)"
@@ -135,52 +198,75 @@ Write-Log "Output: $versionedName.ex5"
 
 # Compile
 try {
-    $processArgs = @("/compile", "`"$SourceFile`"")
+    $logFile = "$tempSourceFile.log"
+    $mql5IncludePath = Split-Path (Split-Path $sourceDir -Parent) -Parent
+    $processArgs = @("/compile:`"$tempSourceFile`"", "/log:`"$logFile`"", "/inc:`"$mql5IncludePath`"", "/optimize")
     
-    Write-Log "Running: $MetaEditorPath $($processArgs -join ' ')"
+    Write-Log "Running: `"$MetaEditorPath`" $($processArgs -join ' ')"
     
-    $process = Start-Process -FilePath $MetaEditorPath -ArgumentList $processArgs -Wait -PassThru -NoNewWindow
+    $process = Start-Process -FilePath $MetaEditorPath -ArgumentList $processArgs -Wait -PassThru -NoNewWindow | Out-Null
     
-    if ($process.ExitCode -eq 0) {
-        Write-Log "Compilation completed successfully" "SUCCESS"
-    } else {
-        Write-Log "Compilation failed with exit code: $($process.ExitCode)" "ERROR"
+    # Read and process compilation log
+    if (Test-Path $logFile) {
+        $logContent = Get-Content -Path $logFile -Encoding UTF8 | Where-Object {$_ -ne ""} | Select-Object -Skip 1
         
-        # Try to find error log
-        $logDir = Join-Path (Split-Path $sourceDir -Parent) "Logs"
-        if (Test-Path $logDir) {
-            $todayLog = Join-Path $logDir "$(Get-Date -Format 'yyyyMMdd').log"
-            if (Test-Path $todayLog) {
-                Write-Log "Check log: $todayLog" "WARN"
-                # Show last log lines
-                $lastLines = Get-Content $todayLog -Tail 10 -Encoding UTF8
-                Write-Log "Last log lines:" "WARN"
-                $lastLines | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        # Determine compilation result color
+        $logColor = "Red"
+        $compilationSuccessful = $false
+        $logContent | ForEach-Object { 
+            if ($_.Contains("0 errors, 0 warnings") -or $_.Contains("0 error(s), 0 warning(s)")) { 
+                $logColor = "Green"
+                $compilationSuccessful = $true
+            } 
+        }
+        
+        # Display compilation results
+        Write-Log "Compilation Results:" $(if($compilationSuccessful) {"SUCCESS"} else {"ERROR"})
+        $logContent | ForEach-Object {
+            # Skip information lines when compilation was successful
+            if (-Not $_.Contains("information:") -or -Not $compilationSuccessful) {
+                Write-Host "  $_" -ForegroundColor $logColor
             }
         }
-        exit $process.ExitCode
+        
+        if (-Not $compilationSuccessful) {
+            # Cleanup temp file on compilation failure
+            if ($needsCleanup -and (Test-Path $tempSourceFile)) {
+                Remove-Item $tempSourceFile -Force -ErrorAction SilentlyContinue
+                Write-Log "Cleaned up temporary file"
+            }
+            exit 1
+        }
+    } else {
+        Write-Log "Compilation log file not found: $logFile" "ERROR"
+        exit 1
     }
 } catch {
     Write-Log "Error starting compiler: $($_.Exception.Message)" "ERROR"
+    
+    # Cleanup temp file on error
+    if ($needsCleanup -and (Test-Path $tempSourceFile)) {
+        Remove-Item $tempSourceFile -Force -ErrorAction SilentlyContinue
+        Write-Log "Cleaned up temporary file"
+    }
     exit 1
 }
 
 # Check compiled file exists
 if (Test-Path $compiledFile) {
-    Write-Log "Found compiled file: $($sourceInfo.BaseName).ex5" "SUCCESS"
+    Write-Log "Found compiled file: $(Split-Path $compiledFile -Leaf)" "SUCCESS"
     
-    # Create versioned copy
+    # Rename compiled file to versioned name
     try {
-        Copy-Item $compiledFile $versionedFile -Force
-        Write-Log "Created versioned copy: $versionedName.ex5" "SUCCESS"
+        Move-Item $compiledFile $versionedFile -Force
+        Write-Log "Created versioned file: $versionedName.ex5" "SUCCESS"
         
         # Show file info
-        $compiledInfo = Get-Item $compiledFile
         $versionedInfo = Get-Item $versionedFile
         
         Write-Log "File information:"
-        Write-Log "  Main: $($compiledInfo.Name) ($($compiledInfo.Length) bytes, modified: $($compiledInfo.LastWriteTime))"
         Write-Log "  Versioned: $($versionedInfo.Name) ($($versionedInfo.Length) bytes)"
+        Write-Log "  Location: $($versionedInfo.Directory.FullName)"
         
         # Optional: show hash for integrity check
         $hash = Get-FileHash $versionedFile -Algorithm SHA256
@@ -196,7 +282,34 @@ if (Test-Path $compiledFile) {
     exit 1
 }
 
+# Cleanup temporary file
+if ($needsCleanup -and (Test-Path $tempSourceFile)) {
+    try {
+        Remove-Item $tempSourceFile -Force
+        Write-Log "Cleaned up temporary file: $(Split-Path $tempSourceFile -Leaf)"
+    } catch {
+        Write-Log "Warning: Could not remove temporary file" "WARN"
+    }
+}
+
 Write-Log "Script completed successfully" "SUCCESS"
 Write-Log "Results:"
-Write-Log "  * Compiled: $baseName.ex5"
 Write-Log "  * Created version: $versionedName.ex5"
+if ($BuildConfig -ne "default") {
+    Write-Log "  * Build config: $BuildConfig"
+}
+if ($WebhookURL) {
+    Write-Log "  * Custom webhook: $WebhookURL"
+}
+
+# Offer to restart MetaTrader terminal
+$restart = Read-Host "Restart MetaTrader terminal? (y/N)"
+if ($restart -eq "y" -or $restart -eq "Y") {
+    Write-Log "Restarting MetaTrader terminal..."
+    try {
+        & "$($MetaEditorPath.Replace("metaeditor64.exe", "terminal64.exe"))" | Out-Null
+        Write-Log "MetaTrader terminal started"
+    } catch {
+        Write-Log "Could not start MetaTrader terminal" "WARN"
+    }
+}
