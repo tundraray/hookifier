@@ -131,7 +131,11 @@ private:
       // Обновляем массив
       if(newSize < m_size) {
          ArrayResize(newEntries, newSize);
-         ArrayCopy(m_entries, newEntries);
+         // Копируем массив вручную, так как ArrayCopy не работает со структурами
+         ArrayResize(m_entries, newSize);
+         for(int i = 0; i < newSize; i++) {
+            m_entries[i] = newEntries[i];
+         }
          m_size = newSize;
       }
    }
