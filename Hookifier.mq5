@@ -5,18 +5,21 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Lavara Software Ltd."
 #property link      "https://www.mql5.com"
-#property version   "1.22"
+#property version   "1.23"
 #property description "Hookifier: Эксперт для отправки уведомлений о сделках на вебхук"
 
 // Версии схемы и эксперта (держите в синхронизации с #property version)
 #define JSON_SCHEMA_VERSION "1.0"
-#define EA_VERSION          "1.22"
+#define EA_VERSION          "1.23"
 
 #include "logger.mqh"
 #include "utils.mqh"
 #include "dedup.mqh"
 #include "webhook_client.mqh"
 #include "json_builder.mqh"
+
+// Предварительное объявление
+string GetTradeTransactionTypeString(ENUM_TRADE_TRANSACTION_TYPE type);
 
 //--- Входные параметры
 input group   "=== Настройки вебхука ==="
@@ -102,9 +105,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    if(!SendToWebhook || WebhookURL == "")
       return;
    
-   if(ShowDebugInfo)
-      Print("=== Торговая транзакция: ", trans.type, " ===");
-   
    // Обрабатываем различные типы транзакций
    switch(trans.type)
    {
@@ -114,8 +114,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          break;
          
       case TRADE_TRANSACTION_ORDER_ADD:
-         if(EnableOrderEvents)
-            ProcessOrderTransaction(trans);
+         // if(EnableOrderEvents)
+         //    ProcessOrderTransaction(trans);
          break;
 
       case TRADE_TRANSACTION_ORDER_UPDATE:
@@ -125,8 +125,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
          
       case TRADE_TRANSACTION_ORDER_DELETE:
-         if(EnableOrderEvents)
-            ProcessOrderDeleteTransaction(trans);
+         // if(EnableOrderEvents)
+         //    ProcessOrderDeleteTransaction(trans);
          break;
          
       case TRADE_TRANSACTION_POSITION:
@@ -135,21 +135,15 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          break;
          
       case TRADE_TRANSACTION_REQUEST:
-         ProcessRequestTransaction(trans, request);
+         // ProcessRequestTransaction(trans, request);
          break;
          
       default:
          if(ShowDebugInfo)
-            Print("Необработанный тип транзакции: ", trans.type);
+            Print("Необработанный тип транзакции: ", GetTradeTransactionTypeString(trans.type));
          break;
    }
 }
-
-//+------------------------------------------------------------------+
-//| Timer function                                                   |
-//+------------------------------------------------------------------+
-
-
 
 
 //+------------------------------------------------------------------+
@@ -193,12 +187,12 @@ void ProcessDealTransaction(const MqlTradeTransaction& trans)
          SendTradeNotification("CLOSE", trans.deal);
       }
       // Частичное закрытие
-      else if(dealEntry == DEAL_ENTRY_OUT_BY)
-      {
-         if(ShowDebugInfo)
-            Print("  Частичное закрытие позиции: ", trans.deal);
-         SendTradeNotification("PARTIAL_CLOSE", trans.deal);
-      }
+      // else if(dealEntry == DEAL_ENTRY_OUT_BY)
+      // {
+      //    if(ShowDebugInfo)
+      //       Print("  Частичное закрытие позиции: ", trans.deal);
+      //    SendTradeNotification("PARTIAL_CLOSE", trans.deal);
+      // }
    }
 }
 
@@ -494,6 +488,28 @@ string GetOrderTypeString(ENUM_ORDER_TYPE orderType)
       case ORDER_TYPE_BUY_STOP_LIMIT: return "BUY_STOP_LIMIT";
       case ORDER_TYPE_SELL_STOP_LIMIT: return "SELL_STOP_LIMIT";
       default:                       return "UNKNOWN";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Получение строкового представления типа торговой транзакции       |
+//+------------------------------------------------------------------+
+string GetTradeTransactionTypeString(ENUM_TRADE_TRANSACTION_TYPE type)
+{
+   switch(type)
+   {
+      case TRADE_TRANSACTION_DEAL_ADD:        return "DEAL_ADD";
+      case TRADE_TRANSACTION_DEAL_UPDATE:     return "DEAL_UPDATE";
+      case TRADE_TRANSACTION_DEAL_DELETE:     return "DEAL_DELETE";
+      case TRADE_TRANSACTION_ORDER_ADD:       return "ORDER_ADD";
+      case TRADE_TRANSACTION_ORDER_UPDATE:    return "ORDER_UPDATE";
+      case TRADE_TRANSACTION_ORDER_DELETE:    return "ORDER_DELETE";
+      case TRADE_TRANSACTION_POSITION:        return "POSITION";
+      case TRADE_TRANSACTION_REQUEST:         return "REQUEST";
+      case TRADE_TRANSACTION_HISTORY_ADD:     return "HISTORY_ADD";
+      case TRADE_TRANSACTION_HISTORY_UPDATE:  return "HISTORY_UPDATE";
+      case TRADE_TRANSACTION_HISTORY_DELETE:  return "HISTORY_DELETE";
+      default:                                return "UNKNOWN";
    }
 }
 
